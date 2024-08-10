@@ -83,4 +83,4 @@ After completing the steps, verify the following:
 - The database service starts correctly and can be accessed without any issues.
 - After a reboot of the EC2 instance, the EBS volume is automatically mounted, and the database is accessible without any data loss.
 
-By linking the EC2 instance to an EBS volume, you have ensured that the database data persists beyond the lifetime of the instance, resolving the issue of the database getting dropped on each instance restart.
+By linking the EC2 instance to an EBS volume, you have ensured that the database data persists beyond the lifetime of the instance, resolving the issue of the database getting dropped on each instance restart. 
