@@ -8,7 +8,7 @@ Ensure that you have GPG installed on your system. Here are the installation ste
 
 ### Installing GPG
 
-- **macOS**:
+- **UbuntuOS**:
 ```bash
   sudo apt-get install gnupg
 ```
@@ -82,5 +82,5 @@ This will create a file named gpg-key.asc containing your public key.
    - Go to GitHub GPG Keys Settings.
    - Click New GPG key.
    - Paste your public key into the text box and click Add GPG key.
-   
+
 That should effective help you sign your commits on github
