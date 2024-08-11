@@ -83,4 +83,4 @@ This will create a file named gpg-key.asc containing your public key.
    - Click New GPG key.
    - Paste your public key into the text box and click Add GPG key.
 
-That should effective help you sign your commits on github
+That should effectively help you sign your commits on GitHub
