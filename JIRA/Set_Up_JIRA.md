@@ -2,19 +2,19 @@
 
 We have two instances for JIRA, one is the cload instance (hosted somewhere else) while the othe is the Server Instance (hosted within premises)
 - Cloud instance:
- - **WHAT YOU GET**:
+ ## **WHAT YOU GET**:
  - Fast to start up
  - Reduced cost
  - No upgrages
  - Security
- - **CONS**:
+ ## **CONS**:
  - No access to changes or database structure 
 - Server instance:
-- **YOU HAVE TO**:
+ ## **YOU HAVE TO**:
  - Install, host and run by yourself
  - Be the Administrator of the instance
  - Manage organisation needs 
- - **PROS**:
+ ## **PROS**:
  - Access to changes and DB structure
 
 
