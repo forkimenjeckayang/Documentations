@@ -18,7 +18,7 @@ We have two instances for JIRA, one is the cload instance (hosted somewhere else
  -Access to changes and DB structure
 
 
-Visit [Atlassian](https://www.atlassian.com/) official website 
-Follow this guide to set up JIRA [click here](https://youtu.be/9uzOx5amps0?si=LS7Iep93Ngm0QNZm)
-[Create new project in JIRA](https://youtu.be/yWMSyRB7aFc?si=zulqSaHnogT_VxBs)
-[Create issses and know issue types](https://youtu.be/sZ7nfA2CwaM?si=kPWJlYkzIizQJPA5)
+- Visit [Atlassian](https://www.atlassian.com/) official website 
+- Follow this guide to set up JIRA [click here](https://youtu.be/9uzOx5amps0?si=LS7Iep93Ngm0QNZm)
+- [Create new project in JIRA](https://youtu.be/yWMSyRB7aFc?si=zulqSaHnogT_VxBs)
+- [Create issses and know issue types](https://youtu.be/sZ7nfA2CwaM?si=kPWJlYkzIizQJPA5)
