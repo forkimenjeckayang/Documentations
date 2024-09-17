@@ -36,3 +36,16 @@ We have two instances for JIRA, one is the cloud instance (hosted somewhere else
    - The sprint backlog is a list of tasks identified by the scrum team to be completed during the scrum sprint. During the sprint planning hte team selects some number of product backlog items usually in the form of user stories , and identifies the tasks necessary to complete eah user story....
 - [Configuring Scrum board in JIRA ](https://youtu.be/T19fiID1ok4?si=MQcBZXUvMJtVYxyy)
    - By default, we have to ToDo, in progress and Done but given JIRA is a customizable tool, we can customize the board on how we want our workflow to be , it must not necessarily be the default...
+- [Configuring status in JIRA](https://youtu.be/UCISG_wcIqk?si=nd9msWwNYmQ1j0oP)
+  - Adding a status will apply just to your tickets or issues and not to your board
+  - Adding a cloumn will apply to your board and status
+- [Basic search of issues in JIRA](https://youtu.be/KGSFrXPO5cU?si=xkyjRXVpEPb_Vjd0)
+  - You can use the basic search filter to search for you're looking for or you may also use the **JQL(Jira Query Langauge)**
+- [Jira user Preference and profile settings in JIRA](https://youtu.be/FBYpeihG4wU?si=Rn9_hCloTuL_D00i)
+- [JIRA Dashboard and gadgets](https://youtu.be/qrP2j4TGXRg?si=jQF7xyT9lhajTTrp)
+  - A dashboard is a combination of multiple indicators which help you keep track of your project. These multiple entities or indicators are what we call the indicators
+  - There are many gadgets to choose from whih can be configired to work with your current project to keep track of progress
+- [Reports in Jira](https://youtu.be/scwI8kq2Orc?si=hKvLVRuHRXi3zUY9)
+  - It has various types of report options you can choose from , one which suits your project needs.
+- [JIRA Marketplace](https://youtu.be/SRMNePINPRA?si=JRbp3xf-6OUTL_DT)
+  - Beacuse JIRA is customizable, it has certain plugins which have been developed and can be integrated with JIRA to extend it's usability. Get to the **apps** section and click on **explore more apps** to access the JIRA marketplace. Any feature which doesn't come by default , you can find a plugin gor that in the marketplace and use to uit your project needs
