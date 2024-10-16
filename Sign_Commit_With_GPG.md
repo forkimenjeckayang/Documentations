@@ -21,7 +21,7 @@ gpg --full-generate-key
 ```
 - You will be prompted to provide some information:
 
-    - **Select Key Type**: Choose RSA and RSA (default).
+    - **Select Key Type**: Choose RSA (sign only).
     - **Key Size**: Choose 4096 bits for stronger security.
     - **Key Expiration**: Choose a key expiration date. You can set it to never expire or choose an expiration date based on your preference.
     - **User ID**: Enter your name and email address (use the email associated with your GitHub account).
