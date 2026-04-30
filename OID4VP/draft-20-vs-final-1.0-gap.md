@@ -1,8 +1,8 @@
 # OID4VP Gap Analysis: Draft 20 → Final 1.0
 
-This document compares **Draft 20** (`draft-20.md`) and **Final 1.0** (`final-1.0.md`) of the OpenID for Verifiable Presentations specification. The focus is on the **main spec content** (Sections 1–15) — the deltas a Verifier or Wallet implementer needs to know to migrate. Appendix-level detail (DC API parameters, format-specific examples, IANA registry deltas) is intentionally **out of scope** for this document.
+This document compares **Draft 20** (`draft-20.md`) and **Final 1.0** (`final-1.0.md`) of the OpenID for Verifiable Presentations specification. The focus is on the deltas a Verifier or Wallet implementer needs to know to migrate.
 
-> **Scope note**: The Digital Credentials API is one of Final 1.0's most consequential additions, but it lives in Appendix A. This doc references DC API only at the conceptual level — see `final-1.0.md` Appendix A for the full DC API parameter and serialization detail.
+> **Scope note**: This doc covers **main spec content (Sections 1–15)** in §1–§11, and **format-specific / DC API appendix gaps** in **§12**. The §12 coverage is **scoped to the formats and transports relevant to this profile**: JWT VC (`jwt_vc_json`), SD-JWT VC (`dc+sd-jwt`), and the DC API. **mdoc (Appendix B.2) is intentionally excluded** because it is not supported by this profile's Issuer. See `final-1.0.md` Appendix B.2 directly if mdoc support is added later.
 
 ---
 
@@ -486,7 +486,95 @@ These are **conformance-relevant** — privacy audits and ecosystem profile comp
 
 ---
 
-## 11. Bottom Line
+## 11. Appendix-Level Gaps (Scoped: DC API + JWT VC + SD-JWT VC)
+
+Most of the gap analysis above covers main-spec content (Sections 1–15). This section captures the **implementation-relevant deltas in the appendices** for **this profile's scope only**:
+
+- **Included**: Appendix A (Digital Credentials API), Appendix B.1 (W3C VC `jwt_vc_json`), Appendix B.3 (SD-JWT VC `dc+sd-jwt`), brief note on B.3.7 (SD-JWT VCLD).
+- **Excluded**: Appendix B.2 (mdoc) — not supported by this profile's Issuer; if added later, read `final-1.0.md` Appendix B.2 directly.
+- **Excluded**: Appendix D (DCQL examples — informational only) and Appendix E (IANA registries — publication only).
+
+### 11.1 Digital Credentials API (Appendix A) — relevant when DC API transport is used
+
+Final 1.0 introduces a full **self-contained profile** for OpenID4VP over the W3C Digital Credentials API (and equivalent native APIs like Android Credential Manager). Draft 20 had **no equivalent** — DC API support is entirely new.
+
+> **Note for this profile**: the current cross-device QR-based flow does **not** use DC API. This section is **forward-looking** — read it before adding browser-based or native-app verifier flows.
+
+| Item | Section | Rule |
+|---|---|---|
+| New response modes | A.2 | `dc_api` (unencrypted) and `dc_api.jwt` (encrypted JWT response per §8.3). |
+| Protocol identifiers | A.1 | `openid4vp-v1-unsigned`, `openid4vp-v1-signed`, `openid4vp-v1-multisigned` — explicit version + request-type taxonomy. |
+| **Origin-based audience** | A.4 | The presentation `aud` (or `domain` in LD proofs) **MUST** be `origin:<verifier-origin>` (e.g. `origin:https://verifier.example.com/`). **Even for signed requests**. The Client Identifier is **not** used as audience. |
+| **`expected_origins`** parameter | A.2 | **REQUIRED** for signed DC API requests; **MUST be ignored** if present in unsigned. Wallet **MUST** match the platform-asserted Origin against this list. |
+| `client_id` in unsigned vs signed | A.2 / A.3 | **Unsigned**: `client_id` **MUST** be omitted (Wallet ignores it if present). **Signed**: `client_id` **MUST** be present. |
+| Signed-request serializations | A.3.2 | **JWS Compact** for single-trust-framework / single-Client-Identifier; **JWS JSON** for multi-trust-framework / multi-Client-Identifier (per-signature `client_id`, `verifier_info`, prefix-specific params live in **per-signature protected headers**, not the payload). |
+| Error response shape | A.4 | Returned in `data` as `{ "error": "<code>" }`. Wallet-generated protocol errors **resolve** the DC API promise (not reject). |
+| `state` in DC API | A.2 | `state` is **not defined** for DC API. Verifier **MUST NOT** assume it appears in the response. |
+| Signature-validation policy | A.3, 5.9.3 | Wallet **MAY** decide whether to enforce a Client Identifier Prefix's normal Request Object signature validation rules in DC API context, based on trust framework / policy / profile. |
+| `origin` Client Identifier Prefix | 5.9.3 | Reserved for DC API context; Wallet **MUST NOT** accept this prefix in requests. |
+
+### 11.2 W3C VC signed as JWT (`jwt_vc_json`) — Appendix B.1
+
+This profile uses `jwt_vc_json`. The format identifier is unchanged from Draft 20, but DCQL introduces format-specific request/metadata rules.
+
+| Item | Section | Rule | Action |
+|---|---|---|---|
+| **DCQL `meta.type_values`** | B.1.1 | **REQUIRED** in every `jwt_vc_json` Credential Query. Non-empty array of string arrays — each inner array is a fully-expanded type IRI list (after `@context` expansion). All listed types in one inner array **MUST** be present in the credential's `type` (any order, extra types allowed); multiple inner arrays are alternatives. | Replaces Draft 20 PE constraints filtering on `$.vc.type`. Verifier query builders must construct `type_values` arrays. |
+| Type expansion behavior | B.1.1 | After `@context` expansion. Types not defined by any `@context` remain unchanged (relative IRIs match as-is). JSON-LD processing **MAY** be skipped if equivalent expansion is achieved. | Implementation choice — full JSON-LD or static-expansion shortcut, but result must be equivalent. |
+| **Claims-path scope** | B.1.2 | Claims Path Pointers in DCQL queries against W3C VC are evaluated against the **Verifiable Credential root** — **NOT** the Verifiable Presentation wrapper. | **Silent breaker**: Verifier query builders that walk paths starting at `vp.verifiableCredential[i]` will get empty results. Use VC-root paths like `["credentialSubject", "given_name"]`. |
+| Metadata `alg_values` | B.1.3.1.3 | `vp_formats_supported.jwt_vc_json.alg_values` (OPTIONAL, non-empty) — supported JOSE `alg` for the JWT VC/VP. If present, the presented VC/VP `alg` JOSE header **MUST** match one of these. | Both Verifier and Wallet declare; mismatch fails negotiation. |
+| Presentation Response binding | B.1.3.1.5 | VP payload **MUST** include `nonce` = request `nonce` and `aud` = **full prefixed Client Identifier** (e.g. `x509_san_dns:client.example.org`). For DC API mode, `aud` is `origin:<origin>` instead. | Wallet must echo `nonce` and use prefixed `client_id` as `aud`. |
+
+### 11.3 SD-JWT VC (`dc+sd-jwt`) — Appendix B.3
+
+This profile uses SD-JWT VC. There ARE substantive Final 1.0 deltas here — the format identifier itself changed and KB-JWT binding rules are codified.
+
+| Item | Section | Rule | Action |
+|---|---|---|---|
+| **Format identifier `dc+sd-jwt`** | B.3.1 | Final 1.0 standardizes on **`dc+sd-jwt`**. Older SD-JWT VC identifier conventions used by Draft 20-era implementations (e.g., `vc+sd-jwt`) are not used here. | **Critical migration item**: rename the format identifier in your DCQL Credential Queries, in `vp_formats_supported` keys, and in any persistence/cache. Old identifier → no Wallet matches. |
+| Holder-binding gating | B.3 intro | If `require_cryptographic_holder_binding: true` (default), Wallet **MUST** return SD-JWT + Key Binding JWT (SD-JWT+KB). SD-JWTs **without** a `cnf` claim cannot be returned in this case. If `false`, Wallet **MAY** return SD-JWT without KB-JWT. | Verifier must decide per-request; Wallet must match credential's `cnf` capability against the request flag. |
+| **DCQL `meta.vct_values`** | B.3.5 | **REQUIRED** in every `dc+sd-jwt` Credential Query — non-empty array of allowed `vct` type identifiers. Wallet **MAY** return credentials that **inherit** from any specified type per SD-JWT VC inheritance rules (not just exact match). | Verifier query builders must declare `vct_values`; Wallet matchers must implement SD-JWT VC inheritance. |
+| **KB-JWT binding** | B.3.6 | Key Binding JWT **MUST** include: `nonce` = request `nonce`, `aud` = **full prefixed Client Identifier** (or `origin:<origin>` in DC API mode), `iat`, `sd_hash` (SHA-256 hash over the SD-JWT presentation = issuer JWT + selected disclosures). | Wallet must compute `sd_hash` over the **specific selectively-disclosed view** being sent. Verifier validates by recomputing. |
+| Metadata fields | B.3.4 | `vp_formats_supported["dc+sd-jwt"]` includes (OPTIONAL non-empty arrays): `sd-jwt_alg_values` (issuer-signed JWT algs) and `kb-jwt_alg_values` (KB-JWT algs). Use **fully-specified algorithm identifiers** per [I-D.ietf-jose-fully-specified-algorithms]. | Both parties declare; algorithms not in the intersection cannot be used. |
+| **Transaction data + holder binding** | B.3.3 | Transaction-data mechanism **requires** `require_cryptographic_holder_binding: true`. Wallets **MUST reject** any request that includes `transaction_data` against a Credential Query with `require_cryptographic_holder_binding: false`. | Hard invariant — enforce at request-validation time, not at presentation time. |
+| **`transaction_data_hashes` in KB-JWT** | B.3.3.1 | When `transaction_data` is present, the response KB-JWT **MUST** include `transaction_data_hashes`: a non-empty array of base64url-encoded hashes. **Hash input is the original `transaction_data` string as received** (do not base64url-decode before hashing). | Bytes-in / bytes-out — preserve the exact wire bytes. |
+| `transaction_data_hashes_alg` | B.3.3.1 | Request **MAY** specify `transaction_data_hashes_alg` (non-empty array of hash IDs from IANA "Named Information Hash Algorithm" registry). If absent, default is **`sha-256`**. Implementations **MUST** support `sha-256`. If the request specified the param, the response KB-JWT **MUST** echo the chosen algorithm in the same parameter. | Default `sha-256`; if a non-default is negotiated, echo it back. |
+
+### 11.4 SD-JWT VCLD (Appendix B.3.7) — only if you adopt the JSON-LD variant
+
+Final 1.0 introduces **SD-JWT VCLD**, an extension of SD-JWT VC that carries Linked Data (JSON-LD) content while keeping selective disclosure. This profile may not need it today, but it's relevant if linked-data semantics are required.
+
+| Item | Section | Rule |
+|---|---|---|
+| `ld` JWT claim | B.3.7.1 | A new OPTIONAL top-level claim carrying compact JSON-LD business content. |
+| Required claims for VCLD | B.3.7.1 | Use SD-JWT-registered claims: `vct` (type), `exp`/`nbf` (validity), `iss`, `status`. |
+| Two-step processing model | B.3.7.2 | Step 1 — SD-JWT VC security processing (signatures, validity, status, schema). Step 2 — business processing (use `ld` if present, else use the full SD-JWT VC). |
+| Inherits all SD-JWT VC rules | — | Where this spec says "SD-JWT VC", "SD-JWT VCLD" can also be used. |
+
+### 11.5 Migration Checklist Additions (this profile)
+
+Add the following to the existing Verifier and Wallet checklists:
+
+#### Verifier (additions)
+- [ ] Replace any old SD-JWT VC format identifier with **`dc+sd-jwt`** in DCQL queries, metadata, and persistence (§11.3).
+- [ ] In `jwt_vc_json` Credential Queries, set `meta.type_values` correctly (replaces Draft 20 PE `$.vc.type` filter) (§11.2).
+- [ ] In `dc+sd-jwt` Credential Queries, set `meta.vct_values` (REQUIRED) and accept inheritance per SD-JWT VC rules (§11.3).
+- [ ] Use **VC-root paths** (e.g., `["credentialSubject", "given_name"]`) in DCQL claims paths for W3C VC — not `vp.verifiableCredential[i]` paths (§11.2).
+- [ ] Declare both `sd-jwt_alg_values` and `kb-jwt_alg_values` in `vp_formats_supported["dc+sd-jwt"]` using fully-specified algorithm identifiers (§11.3).
+- [ ] Reject any `transaction_data` request that targets a Credential Query with `require_cryptographic_holder_binding: false` (§11.3 — Wallet enforces, but Verifier should not construct such requests).
+- [ ] Validate KB-JWT in returned SD-JWT presentations: recompute `sd_hash`, verify `nonce`, verify `aud` = full prefixed Client Identifier (§11.3).
+
+#### Wallet (additions)
+- [ ] Implement `dc+sd-jwt` format support (parse, evaluate DCQL `vct_values` with inheritance, produce SD-JWT presentations + KB-JWT) (§11.3).
+- [ ] Build the KB-JWT with `nonce`, **full prefixed** `aud`, `iat`, and `sd_hash` over the specific selectively-disclosed view (§11.3).
+- [ ] **MUST reject** `transaction_data` requests if the Credential Query has `require_cryptographic_holder_binding: false` (§11.3).
+- [ ] Compute `transaction_data_hashes` over the **received `transaction_data` strings as-is** (no base64url decode before hashing). Default algorithm `sha-256`; honor `transaction_data_hashes_alg` if specified (§11.3).
+- [ ] For W3C VC: evaluate Claims Path Pointers against the VC root, not the VP wrapper (§11.2).
+- [ ] If/when DC API support is added later: implement `expected_origins` validation, origin-based audience binding, and JWS Compact / JWS JSON serialization handling (§11.1 — forward-looking).
+
+---
+
+## 12. Bottom Line
 
 Draft 20 → Final 1.0 is a **protocol-model migration**. The four central shifts — DCQL replacing PE, DCQL-keyed `vp_token` replacing `presentation_submission`, Client Identifier Prefix replacing `client_id_scheme`, and unsigned encrypted JWT replacing JARM — touch nearly every layer of a Verifier and Wallet implementation.
 
