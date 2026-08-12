@@ -1,0 +1,34 @@
+# Local audit state
+.STATUS
+
+# Generated AWS inventory and deep-analysis snapshots.
+# These can contain task-definition environment values and other sensitive metadata.
+sandbox-raw-data-*.json
+deep-analysis-*.json
+
+# Generated repository-detection output can contain plaintext environment values.
+repo-detection-output*.txt
+
+# Local migration dry-run and execution logs
+.migration-logs/
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Common editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.orig
+*.rej
+.idea/
+.vscode/
+
+# Keep the curated, sanitized repository mapping under version control.
+!verified-repo-mappings.json

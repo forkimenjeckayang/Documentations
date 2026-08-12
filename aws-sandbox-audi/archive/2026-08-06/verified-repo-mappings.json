@@ -1,0 +1,79 @@
+{
+  "be-kc-client-oid4vc-dev": {
+    "github": "https://github.com/adorsys/be-kc-client-oid4vc",
+    "branch": "develop",
+    "workflow": ".github/workflows/aws-develop.yml",
+    "verified": true,
+    "description": "Backend OID4VC Issuer (Development)"
+  },
+  "be-kc-client-oid4vc": {
+    "github": "https://github.com/adorsys/be-kc-client-oid4vc",
+    "branch": "main",
+    "workflow": ".github/workflows/aws-main.yml",
+    "verified": true,
+    "description": "Backend OID4VC Issuer (Production)"
+  },
+  "fe-kc-client-oid4vc": {
+    "github": "https://github.com/adorsys/fe-kc-client-oid4vc",
+    "branch": "develop",
+    "workflow": ".github/workflows/aws-dev.yml",
+    "verified": true,
+    "description": "Frontend OID4VC Issuer"
+  },
+  "fe-kc-client-oid4vc1-main": {
+    "github": "https://github.com/adorsys/fe-kc-client-oid4vc",
+    "branch": "main",
+    "workflow": ".github/workflows/aws.yml",
+    "verified": true,
+    "description": "Frontend OID4VC Issuer (Main branch)"
+  },
+  "nginx_datev_wallet": {
+    "github": "https://github.com/adorsys/eudiw-app",
+    "branch": "develop",
+    "workflow": ".github/workflows/aws-proxy.yml",
+    "path": "nginx/",
+    "verified": true,
+    "description": "CORS Proxy / Nginx reverse proxy"
+  },
+  "portal-eudi-verifier": {
+    "github": "https://github.com/adorsys/fe-eudiw-verifier",
+    "branch": "develop",
+    "workflow": ".github/workflows/AWS-CD.yml",
+    "verified": true,
+    "description": "EUDI Verifier Portal (Frontend)"
+  },
+  "portal-eudi-verifier-master": {
+    "github": "https://github.com/adorsys/fe-eudiw-verifier",
+    "branch": "master",
+    "workflow": ".github/workflows/AWS-CD.yml",
+    "verified": true,
+    "description": "EUDI Verifier Portal (Master branch)"
+  },
+  "eudiw-verifier-staging": {
+    "github": "https://github.com/adorsys/eudiw-verifier",
+    "branch": "develop",
+    "workflow": ".github/workflows/deploy-verifier-develop.yml",
+    "verified": true,
+    "description": "EUDI Verifier Backend (Java, Staging)"
+  },
+  "eudiw-verifier": {
+    "github": "https://github.com/adorsys/eudiw-verifier",
+    "branch": "main",
+    "workflow": ".github/workflows/deploy-verifier-main.yml",
+    "verified": true,
+    "description": "EUDI Verifier Backend (Java, Main)"
+  },
+  "keycloak-wazuh": {
+    "github": "https://github.com/adorsys/keycloak-ssi-deployment",
+    "branch": "main",
+    "workflow": ".github/workflows/cd.yml",
+    "verified": false,
+    "description": "Keycloak with Wazuh security monitoring"
+  },
+  "kc_wazuh": {
+    "github": "https://github.com/adorsys/keycloak-ssi-deployment",
+    "branch": "main",
+    "verified": false,
+    "description": "Keycloak security monitoring"
+  }
+}
