@@ -113,9 +113,11 @@ For nginx, use existing target VPC `vpc-073150aef0868a8af`:
 - New target group of type `ip` on container port 8080
 - Issued target ACM certificate in `eu-central-1`
 
-The source `corsproxy` ALB stays unchanged until the new nginx service is tested
-and `proxy.solutions.adorsys.com` is cut over. It is retained temporarily for
-rollback and later retired; it is never copied or migrated.
+The target nginx service and new ALB are deployed and validated. Production
+`proxy.solutions.adorsys.com` was cut over to the target ALB on 2026-08-13. The
+source `corsproxy` ALB and ECS service remain available only for rollback during
+monitoring and will be retired after approval; the ALB itself was never copied or
+migrated.
 
 ## 5. Migration Approach in Plain Language
 
@@ -339,10 +341,9 @@ Nothing from the source ALB is transferred; the target receives a newly created 
 The source role is over-privileged and is used as both task and execution role.
 Do not reproduce that. nginx has no AWS API usage in its task definition.
 
-### Target Resources to Create
+### Deployed Target Resources
 
-The target account currently has no ECS cluster, nginx ECR repository, nginx log
-group, or ECS execution role. Create:
+The migration created or reused these target resources:
 
 1. ECR repository `nginx_datev_wallet` and copy the verified image.
 2. Log group `/ecs/cors_proxy` with an agreed retention period.
@@ -350,22 +351,23 @@ group, or ECS execution role. Create:
    a task role unless later inspection proves nginx calls AWS APIs.
 4. ECS cluster `Datev_Wallet`.
 5. Two dedicated security groups in `vpc-073150aef0868a8af`:
-   - ALB SG: inbound 443 from the internet; optional port 80 redirect only.
+   - ALB SG: inbound 443 from the internet.
    - Task SG: inbound 8080 only from the ALB SG; outbound 80/443 for proxy targets,
      ECR/log access through NAT, and DNS as provided by the VPC resolver.
-6. Target group `nginx-cors-tg`: HTTP 8080, target type `ip`, health path `/`,
+6. Target group `nginx-proxy-targets`: HTTP 8080, target type `ip`, health path `/`,
    matcher 200.
-7. New internet-facing ALB `nginx-cors-alb` in existing public subnets:
+7. New internet-facing ALB `nginx-proxy-migration` in existing public subnets:
    - `subnet-053b37b6b4a517afb` (eu-central-1a)
    - `subnet-003d0ccab3982e90a` (eu-central-1b)
    - `subnet-0f88842f7789cc09a` (eu-central-1c)
 8. HTTPS listener 443 using issued certificate
    `arn:aws:acm:eu-central-1:982081049921:certificate/d556613f-db8a-44cb-b4f2-bf360443346a`,
-   forwarding to `nginx-cors-tg`. Optionally create HTTP 80 only to redirect to
-   HTTPS.
+   forwarding to `nginx-proxy-targets`. No HTTP listener is created, matching the
+   verified HTTPS-only source behavior.
 9. Clean target task definition based on `cors_proxy:6`, but using the target
    execution-role ARN, target ECR digest/fixed tag, and target log Region.
-10. ECS service `nginx-cors`, desired count 1, in existing private subnets:
+10. ECS service `nginx-cors`, desired count 1 by owner decision because this is a
+    low-traffic proxy, in existing private subnets:
     - `subnet-01ea66e1eadb764b8` (eu-central-1a)
     - `subnet-02f5858452931cb05` (eu-central-1b)
     - `subnet-0419198c0dda051f3` (eu-central-1c)
@@ -373,37 +375,45 @@ group, or ECS execution role. Create:
     - Register `nginx-proxy:8080` with the new target group
     - Enable deployment circuit breaker and automatic rollback
 
+Running one task reduces Fargate cost but removes task-level redundancy. A task
+failure or replacement can cause a short interruption while ECS starts a healthy
+replacement. Set `TARGET_DESIRED_COUNT=2` when continuous availability becomes
+more important than this cost saving.
+
 The selected private subnets have a default route through NAT
 `nat-001dff58f95b01e5a`; the public ALB subnets route through internet gateway
 `igw-07b800fe398f7f448`. No VPC creation is required.
 
 ### Test and Domain Cutover
 
-1. Wait for one running ECS task and a healthy target in `nginx-cors-tg`.
-2. Create temporary CNAME `proxy-migration.solutions.adorsys.com` in the
-   authoritative sandbox Route 53 zone, pointing to the new ALB DNS name. This is a
-   normal cross-account CNAME, like the wallet test record.
-3. Test HTTPS root and the real proxy behavior:
+1. Run `scripts/migrate-nginx-proxy.sh --dry-run`, review its ignored log, and
+   then run `scripts/migrate-nginx-proxy.sh` to create/reuse the target without changing DNS.
+2. The script uses `curl --connect-to` to reach the target ALB while preserving
+   `proxy.solutions.adorsys.com` for TLS SNI and the HTTP Host. No temporary DNS
+   record is required.
+3. Require one running ECS task, one healthy target, and these automated checks:
    - `GET /` returns the CORS proxy page as 200.
    - OPTIONS preflight returns 204.
    - CORS headers include the required methods and Authorization/DPoP headers.
-   - GET/POST proxy calls, redirect rewriting, and the wallet's real credential
-     flow work through the temporary hostname.
-4. Lower the production record TTL if it is not already low.
-5. Update the existing `proxy.solutions.adorsys.com` Route 53 alias from source
-   ALB `corsproxy` to the new target ALB. This is a DNS update, not a domain move.
-   Because the ALB lives in another account and may not appear in the sandbox
-   console picker, use a CNAME for this non-apex hostname or submit an AliasTarget
-   with the new ALB DNS name and its canonical hosted-zone ID through the CLI.
-6. Verify public DNS, TLS, ALB target health, ECS task health, CORS behavior, and
+   - Source and target root response bodies are byte-identical.
+4. After approval, run `scripts/migrate-nginx-proxy.sh --cutover`. It revalidates
+   the target and performs one Route 53 AliasTarget `UPSERT` using the new ALB DNS
+   name and canonical hosted-zone ID. It does not delete the record first.
+5. Verify public DNS, TLS, ALB target health, ECS task health, CORS behavior, and
    wallet flows.
-7. Keep the source ECS service, ECR image, ALB, target group, and DNS details intact
-   during the rollback period. Roll back by restoring the old DNS alias.
-8. Only after monitoring and approval: scale source service to zero, then retire
+6. Keep the source ECS service, ECR image, ALB, target group, and DNS details intact
+   during the rollback period. Roll back with `scripts/migrate-nginx-proxy.sh --rollback`.
+7. Only after monitoring and approval: scale source service to zero, then retire
    the source ALB/ECS/ECR resources in separate cleanup steps.
 
 The domain remains `proxy.solutions.adorsys.com`; no new domain or hosted-zone
 migration is needed for this workload cutover.
+
+Cutover completed successfully on 2026-08-13. Route 53 now aliases the production
+hostname to the target ALB canonical zone `Z215JYRZR1TBD5`. Post-cutover checks
+confirmed target ECS `1/1`, ALB target `1/1` healthy, root HTTP 200, and CORS
+preflight 204. Keep the source intact during monitoring; use
+`scripts/migrate-nginx-proxy.sh --rollback` if an accepted rollback trigger occurs.
 
 ## 10. Step 5 — Migrate the Wallet S3 Bucket and CloudFront
 
@@ -646,9 +656,9 @@ steps do not change production traffic. The command-by-command procedure is in t
 
 ### nginx
 
-- [ ] ECS desired count and running count are both one
-- [ ] Load-balancer target is healthy
-- [ ] `proxy.solutions.adorsys.com` has a valid certificate
+- [x] ECS desired count and running count are both one
+- [x] Load-balancer target is healthy
+- [x] `proxy.solutions.adorsys.com` has a valid certificate and targets the new ALB
 - [ ] GET, POST, OPTIONS, headers, and redirects work
 - [ ] Wallet credential flows work
 - [ ] CloudWatch logs are available

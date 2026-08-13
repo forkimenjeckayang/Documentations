@@ -42,7 +42,7 @@ Keycloak database only after every target component has passed isolated testing.
 | 3 | Copy all required ECR images under fixed migration tags | None |
 | 4 | Initial-copy both S3 buckets | None |
 | 5 | Recreate CloudFront with a temporary wildcard alias and test through a temporary hostname | None |
-| 6 | Recreate nginx ECS and test through a temporary hostname | None |
+| 6 | Recreate nginx ECS and test the target ALB with `curl --connect-to` | None |
 | 7 | Create a baseline Keycloak AMI, copy it to the target, and launch an isolated target instance | One controlled source reboot |
 | 8 | Restore a rehearsal PostgreSQL dump and test Keycloak through a temporary hostname | No production change |
 | 9 | Lower DNS TTLs and run the final S3 sync | None |
@@ -490,7 +490,77 @@ Use these source values as the behavioral baseline:
 The running endpoint returned root HTTP 200 and an OPTIONS preflight returned 204
 with GET/POST/OPTIONS plus Authorization, DPoP, and client-attestation headers.
 
-### 9.2 Copy the Exact nginx Image
+### Verified Target-Ready State Before Cutover - 2026-08-13
+
+The deployment completed successfully and an immediate idempotent rerun reused
+the existing resources without creating duplicate security-group rules, task
+definitions, or ECS deployments:
+
+- Target ALB: `nginx-proxy-migration-1538385164.eu-central-1.elb.amazonaws.com`
+- Target group: `nginx-proxy-targets`
+- Task definition: `cors_proxy:1`
+- ECS service: desired/running `1/1`, pending `0`
+- ALB target health: `1/1` healthy
+- Direct target tests: HTTPS root 200 and CORS OPTIONS 204
+- Source and target root bodies: byte-identical
+- Production DNS: still points to source ALB `corsproxy`
+- Successful verification log:
+  `.migration-logs/nginx-proxy-deploy-20260813T133026Z-1672267.log`
+
+The service was intentionally scaled from two tasks to one on 2026-08-13 after
+the owner confirmed its low usage. This reduces Fargate cost but accepts a short
+possible interruption if the single task fails or is replaced.
+
+This records the pre-cutover gate. The production cutover described below has now
+completed.
+
+### Completed Production Cutover - 2026-08-13
+
+`scripts/migrate-nginx-proxy.sh --cutover` completed successfully:
+
+- Production record: `proxy.solutions.adorsys.com`
+- New alias target:
+  `dualstack.nginx-proxy-migration-1538385164.eu-central-1.elb.amazonaws.com`
+- Target ALB canonical hosted-zone ID: `Z215JYRZR1TBD5`
+- Target ECS service: desired/running `1/1`, pending `0`, rollout `COMPLETED`
+- Target health: `10.0.3.48:8080` healthy
+- Production root: HTTPS 200
+- Production CORS preflight: 204 with the required methods and headers
+- Route 53 change: `INSYNC`
+- Cutover log:
+  `.migration-logs/nginx-proxy-cutover-20260813T150217Z-1751476.log`
+- Saved pre-cutover DNS record:
+  `.migration-logs/nginx-proxy-dns-before-cutover-20260813T150301Z.json`
+
+The source service remains active at desired/running `1/1` for rollback. Do not
+retire its ECS service, ALB, target group, or ECR image until monitoring, a real
+wallet flow, and owner approval are complete. The temporary
+`proxy-migration.solutions.adorsys.com` CNAME may be removed after monitoring.
+
+### 9.2 Use the Idempotent Migration Script
+
+Use [`scripts/migrate-nginx-proxy.sh`](scripts/migrate-nginx-proxy.sh). It keeps
+target deployment, production cutover, and rollback as separate operations:
+
+```bash
+# Read-only source/target checks and CREATE/REUSE plan
+scripts/migrate-nginx-proxy.sh --dry-run
+
+# Create/reuse target ECR, ECS, and the new ALB; test without changing DNS
+scripts/migrate-nginx-proxy.sh
+
+# Run only after target acceptance
+scripts/migrate-nginx-proxy.sh --cutover
+
+# Restore the sandbox ALB alias if rollback is required
+scripts/migrate-nginx-proxy.sh --rollback
+```
+
+Every mode writes a private Git-ignored log under `.migration-logs/`. The default
+deployment must finish with `TARGET READY` before cutover is considered. The
+script never deletes or scales down the source stack.
+
+### 9.3 Copy the Exact nginx Image
 
 Create only the target nginx repository first:
 
@@ -503,10 +573,10 @@ aws ecr create-repository \
   --encryption-configuration encryptionType=AES256
 ```
 
-The source is a multi-architecture OCI index. Prefer an OCI-aware copy with all
-platforms, for example `skopeo copy --all`, and tag the target
-`migration-20260812`. Do not rely on a plain host-native Docker pull if complete
-multi-platform preservation is required. The current Fargate task itself requires
+The source is a multi-architecture OCI index. The migration script uses
+`docker buildx imagetools create` to copy the complete index and assigns a fixed
+digest-derived migration tag. It then verifies that the target digest equals the
+source index digest. The current Fargate task itself requires
 Linux/amd64 child digest
 `sha256:7966b3ab99e0366a1ece8eeaa095fbe8e470085eed6731db96d6aaf2d9faa235`.
 
@@ -514,7 +584,7 @@ After copying, verify the target manifest/digest with `describe-images` and
 `batch-get-image`. Register the ECS task against a fixed tag or digest, never
 mutable `latest`.
 
-### 9.3 Target Network and Security
+### 9.4 Target Network and Security
 
 Use existing target VPC `vpc-073150aef0868a8af`; create no VPC.
 
@@ -525,17 +595,16 @@ Use existing target VPC `vpc-073150aef0868a8af`; create no VPC.
 
 Create separate security groups:
 
-- `nginx-cors-alb-sg`: inbound HTTPS 443 from clients; optional HTTP 80 only for
-  redirect; outbound TCP 8080 to the task SG.
-- `nginx-cors-task-sg`: inbound TCP 8080 only from the ALB SG; outbound traffic
+- `nginx-proxy-alb-sg`: inbound HTTPS 443 from clients.
+- `nginx-proxy-task-sg`: inbound TCP 8080 only from the ALB SG; outbound traffic
   required for ECR/logs and HTTP/HTTPS proxy destinations.
 
 Do not reuse the source default security group, which exposes unnecessary ports.
 
-### 9.4 Create Target ECS Prerequisites
+### 9.5 Create Target ECS Prerequisites
 
-The target inventory currently has no nginx repository, ECS cluster, execution
-role, or log group. Create:
+Before migration the target had no nginx repository, ECS cluster, execution role,
+or log group. The migration created:
 
 - Cluster `Datev_Wallet`
 - Log group `/ecs/cors_proxy` in `eu-central-1` with an agreed retention
@@ -545,20 +614,19 @@ role, or log group. Create:
 Do not set a task role: the current nginx task has no AWS API integration. Do not
 copy the source role's verifier-secret or CloudWatch-full-access policies.
 
-### 9.5 Create the New nginx ALB
+### 9.6 Create the New nginx ALB
 
 Create, rather than migrate, these resources in `eu-central-1`:
 
-1. Target group `nginx-cors-tg`, protocol HTTP, port 8080, target type `ip`, VPC
+1. Target group `nginx-proxy-targets`, protocol HTTP, port 8080, target type `ip`, VPC
    `vpc-073150aef0868a8af`, health path `/`, matcher 200.
-2. Internet-facing application load balancer `nginx-cors-alb` in all three public
-   subnets with `nginx-cors-alb-sg`.
+2. Internet-facing application load balancer `nginx-proxy-migration` in all three public
+   subnets with `nginx-proxy-alb-sg`.
 3. HTTPS listener 443 forwarding to the target group, using certificate
    `arn:aws:acm:eu-central-1:982081049921:certificate/d556613f-db8a-44cb-b4f2-bf360443346a`.
-4. Optional HTTP listener 80 that redirects to HTTPS; never forward plaintext to
-   the service.
+4. No HTTP listener is created; this preserves the verified HTTPS-only source behavior.
 
-### 9.6 Register the Clean Task Definition and Service
+### 9.7 Register the Clean Task Definition and Service
 
 Register a clean `cors_proxy` task definition with:
 
@@ -568,24 +636,32 @@ Register a clean `cors_proxy` task definition with:
 - Container `nginx-proxy`, fixed target image, port 8080
 - awslogs group `/ecs/cors_proxy`, Region `eu-central-1`
 
-Create service `nginx-cors` with desired count 1, no public IP, the three private
-subnets, `nginx-cors-task-sg`, the new target group, and deployment circuit
+Create service `nginx-cors` with desired count 1 for this low-traffic proxy, no public IP,
+the three private subnets, `nginx-proxy-task-sg`, the new target group, and deployment circuit
 breaker rollback enabled. Wait for service stability and healthy target status.
 
-### 9.7 Temporary Test and Production DNS Cutover
+This owner-approved count saves Fargate cost but has no task-level redundancy;
+a task failure or replacement may briefly interrupt the proxy. Run the migration
+script with `TARGET_DESIRED_COUNT=2` if that tradeoff changes.
 
-1. Create normal CNAME `proxy-migration.solutions.adorsys.com` in the authoritative
-   sandbox zone, pointing to the new target ALB hostname. The target ALB may not
-   appear in the sandbox account's Route 53 selector.
-2. Test root 200, OPTIONS 204, GET/POST proxying, CORS/Authorization/DPoP headers,
-   redirects, and real wallet flows.
-3. Update existing `proxy.solutions.adorsys.com` to the new ALB only after tests
-   pass. For this non-apex name, a cross-account CNAME is acceptable; alternatively
-   use the target ALB DNS name and canonical hosted-zone ID in an AliasTarget change.
-4. Verify DNS, TLS, target health, ECS stability, logs, and wallet flows.
-5. Keep all source nginx resources unchanged through the rollback period. Restore
-   the previous DNS record to roll back.
-6. After monitoring and separate approval, scale source ECS to zero and retire the
+### 9.8 Test Without Temporary DNS and Cut Over Production
+
+1. The default script run uses `curl --connect-to` so the connection reaches the
+   target ALB while TLS SNI and the HTTP Host remain `proxy.solutions.adorsys.com`.
+   No temporary hostname or DNS record is created.
+2. It requires root HTTP 200, OPTIONS 204, the expected CORS/Authorization/DPoP
+   headers, valid TLS, healthy targets, stable ECS, and byte-identical source and
+   target root responses.
+3. `--cutover` repeats target health and endpoint tests, verifies production DNS
+   still has the expected source or target value, saves the previous record under
+   `.migration-logs/`, and performs one Route 53 `UPSERT` to the new ALB DNS
+   name and canonical hosted-zone ID. It never deletes the DNS record first.
+4. During DNS caching, old clients reach the healthy source and new clients reach
+   the healthy target. Validate the real wallet flow immediately after cutover.
+5. `--rollback` first tests the source directly and then performs an idempotent
+   `UPSERT` back to source ALB `corsproxy-2023641953.eu-north-1.elb.amazonaws.com`.
+6. Keep all source nginx resources unchanged throughout the rollback period.
+7. After monitoring and separate approval, scale source ECS to zero and retire the
    old source ALB, target group, service, and ECR image.
 
 The final public name remains `proxy.solutions.adorsys.com`; no domain purchase,
@@ -724,6 +800,32 @@ Keep `wallet-react-app-main` private. The target bucket policy must grant only t
 CloudFront service principal and must condition access on the new target
 distribution ARN. Do not copy the source bucket's public-read statement or its
 stale distribution ID.
+
+### How OAC and the S3 Bucket Policy Work Together
+
+Origin Access Control (OAC) allows CloudFront to sign requests to the private S3
+origin using AWS Signature Version 4. The OAC configuration and the S3 permission
+are two halves of the same connection:
+
+```text
+Browser -> CloudFront -> OAC-signed request -> private S3 bucket
+```
+
+- `create-wallet-cloudfront.sh` creates or reuses the OAC and attaches it to the
+  target distribution's `wallet-react-app-main` origin.
+- `migrate-s3-buckets.sh --wallet-cloudfront-distribution-id <ID>` validates that
+  the distribution belongs to the target account and uses the expected bucket,
+  then adds the corresponding S3 bucket-policy statement.
+- The bucket policy grants only `s3:GetObject` to the CloudFront service principal
+  and restricts it with `AWS:SourceArn` to that one target distribution ARN. The
+  policy references the distribution ARN rather than the OAC ID.
+- `wallet-app-metadata-main` is independent: it does not use CloudFront or OAC and
+  retains its separate `PublicReadGetObject` policy.
+
+Creating the OAC alone is insufficient because S3 would still reject the signed
+request. Adding the bucket policy alone is also insufficient because CloudFront
+must use OAC to sign its origin request. With both configured, direct S3 access is
+denied while access through the approved CloudFront distribution succeeds.
 
 First prepare both target certificates. Their validation CNAMEs must be written to
 the publicly authoritative sandbox hosted zone, not the duplicate non-delegated
@@ -1028,7 +1130,7 @@ cutover.
 
 Change only one record at a time and validate it before continuing:
 
-1. `proxy.solutions.adorsys.com` to the target nginx route
+1. `proxy.solutions.adorsys.com` to the target nginx route - completed 2026-08-13
 2. `keycloak-demo.solutions.adorsys.com` to the target Keycloak route
 3. `wallet.solutions.adorsys.com` to target CloudFront during the alias move
 
@@ -1044,7 +1146,7 @@ separate, optional project after the workloads are stable.
 - [ ] All three target ECR images verified by digest
 - [ ] Initial and final-preparation S3 syncs verified
 - [ ] Target CloudFront tested through the temporary HTTPS hostname
-- [ ] Target nginx tested through a temporary hostname
+- [x] Target nginx passed `curl --connect-to` TLS, root, and CORS tests without a DNS change
 - [ ] Baseline AMI copied, encrypted, and owned by the target account
 - [ ] Rehearsal PostgreSQL restore passed
 - [ ] Target Keycloak passed isolated functional testing
@@ -1055,7 +1157,8 @@ separate, optional project after the workloads are stable.
 ### During the Window
 
 1. Run the final S3 sync and verify it.
-2. Cut over nginx proxy DNS and validate wallet proxy calls.
+2. Cut over nginx proxy DNS and validate wallet proxy calls. DNS cutover is
+   complete; full wallet-flow acceptance remains pending.
 3. Stop source Keycloak writes.
 4. Create, checksum, transfer, and restore the final PostgreSQL backup.
 5. Start and validate target Keycloak.

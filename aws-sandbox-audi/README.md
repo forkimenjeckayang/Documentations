@@ -5,6 +5,7 @@
 **Target account:** `982081049921` (profile `default`)  
 **Target workload Region:** `eu-central-1`  
 **Last live source audit:** 2026-08-11 using read-only AWS CLI calls
+**Last live migration verification:** 2026-08-13 after nginx production cutover
 
 This repository documents the remaining legacy-sandbox resources and their
 migration to the target AWS account. It does not create a new VPC; target resources
@@ -23,6 +24,11 @@ Only three top-level documents are authoritative:
 
 Superseded snapshots remain under [archive](archive/README.md) for traceability and
 must not be used as the current runbook.
+
+For an approachable explanation of the ECS/Fargate architecture used by the
+nginx migration, see the separate
+[Understanding Amazon ECS on Fargate: components, workflow, and HTTPS setup](../ECS-FARGATE-HTTPS-GUIDE.md)
+guide. It is background material, not a fourth authoritative migration document.
 
 ## Current Legacy-Sandbox State
 
@@ -93,6 +99,7 @@ Interpretation:
 | [`scripts/migrate-s3-buckets.sh`](scripts/migrate-s3-buckets.sh) | Idempotently create/configure target buckets, copy changed objects, and verify counts and bytes |
 | [`scripts/prepare-target-certificates.sh`](scripts/prepare-target-certificates.sh) | Reuse or request target ALB and CloudFront certificates and ensure authoritative validation CNAMEs |
 | [`scripts/create-wallet-cloudfront.sh`](scripts/create-wallet-cloudfront.sh) | Idempotently prepare the wallet OAC, wildcard-enabled target distribution, and cross-account ownership TXT without moving production traffic |
+| [`scripts/migrate-nginx-proxy.sh`](scripts/migrate-nginx-proxy.sh) | Idempotently copy the nginx image, create/reuse target ECS and a new ALB, test without DNS changes, then perform an explicit cutover or rollback |
 
 Always run a script with `--dry-run` first. Migration logs are written under
 `.migration-logs/`, use restrictive permissions, and are excluded by `.gitignore`.
@@ -106,7 +113,7 @@ they may contain task-definition environment data or sensitive AWS metadata.
 | Wallet S3 and CloudFront | Migrated; production on target and under monitoring |
 | Metadata S3 data/policy | Migrated; consumer URL updates still require confirmation |
 | Target ACM certificates | Issued in `eu-central-1` and `us-east-1` |
-| nginx ECS/ECR/new ALB | Live source inventoried; target migration plan ready, not deployed |
+| nginx ECS/ECR/new ALB | Migrated; production DNS points to target ALB and workload is under monitoring |
 | Keycloak EC2/PostgreSQL/new ALB | Not yet migrated |
 | Route 53 hosted zone | Remains authoritative in sandbox until workloads are stable |
 
@@ -130,5 +137,11 @@ they may contain task-definition environment data or sensitive AWS metadata.
 - Production wallet traffic is verified on target bucket `wallet-react-app-main`;
   direct S3 access remains blocked and source distribution `E32T5I17KDIDEL` owns
   no aliases. CloudFront/S3 cutover completed on 2026-08-12.
+- nginx production cutover completed on 2026-08-13. The Route 53 alias for
+  `proxy.solutions.adorsys.com` now targets
+  `nginx-proxy-migration-1538385164.eu-central-1.elb.amazonaws.com` in the target
+  account. Post-cutover checks returned root HTTP 200 and CORS preflight 204;
+  target ECS and ALB health are `1/1`. The source service remains running for
+  rollback during monitoring.
 
 Follow the runbook’s validation gates before deleting any source resource.
