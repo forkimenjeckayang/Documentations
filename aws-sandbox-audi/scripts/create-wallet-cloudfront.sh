@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 
+# Prepare the wallet CloudFront distribution in the target AWS account.
+#
+# Architecture:
+#   authoritative sandbox Route 53 -> target CloudFront -> private target S3
+#
+# This is a preparation script, not a production-cutover script. It creates or
+# reuses target resources and DNS ownership proof, but does not move the production
+# wallet domain or modify the source distribution. This allows testing first and
+# keeps the source available for rollback.
+#
+# Run with --dry-run first, review the private log under .migration-logs/, and then
+# run without --dry-run to apply the preparation changes.
+
 set -Eeuo pipefail
+
+# Expected endpoints. Environment overrides are supported, while the account
+# checks prevent accidental changes in an unexpected AWS account.
 
 readonly TARGET_ACCOUNT_ID="${TARGET_ACCOUNT_ID:-982081049921}"
 readonly TARGET_PROFILE="${TARGET_PROFILE:-default}"
@@ -15,10 +31,19 @@ readonly CERTIFICATE_DOMAIN="${CERTIFICATE_DOMAIN:-*.solutions.adorsys.com}"
 readonly SOURCE_ACCOUNT_ID="${SOURCE_ACCOUNT_ID:-917848404243}"
 readonly SOURCE_PROFILE="${SOURCE_PROFILE:-sandbox}"
 readonly SOURCE_DISTRIBUTION_ID="${SOURCE_DISTRIBUTION_ID:-E32T5I17KDIDEL}"
+
+# DNS remains in the sandbox because this zone is publicly authoritative. Route 53
+# can still point to CloudFront in the target account.
 readonly HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-Z02911502N07V5SNAMLHL}"
 readonly HOSTED_ZONE_NAME="${HOSTED_ZONE_NAME:-solutions.adorsys.com.}"
 readonly WALLET_DOMAIN="${WALLET_DOMAIN:-wallet.solutions.adorsys.com}"
+
+# The wildcard supports target testing while the more-specific production alias
+# remains attached to the source distribution.
 readonly WILDCARD_ALIAS="${WILDCARD_ALIAS:-*.solutions.adorsys.com}"
+
+# This TXT proves cross-account domain control to CloudFront. It is not an ACM
+# validation record and does not carry application traffic.
 readonly OWNERSHIP_TXT_NAME="${OWNERSHIP_TXT_NAME:-_wallet.solutions.adorsys.com.}"
 
 readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -110,6 +135,8 @@ initialize_logging() {
     mode="dry-run"
   fi
 
+  # Logs can contain AWS identifiers, so use private permissions. The repository
+  # excludes .migration-logs/ from Git.
   mkdir -p -- "$LOG_DIR"
   chmod 700 "$LOG_DIR"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -164,6 +191,8 @@ verify_authoritative_zone() {
   [[ "$(jq -r '.HostedZone.Config.PrivateZone' <<<"$zone")" == "false" ]] ||
     die "Hosted zone '$HOSTED_ZONE_ID' is private"
 
+  # A hosted zone may exist without public delegation. Confirm that this zone's
+  # name servers match public DNS before writing the ownership TXT.
   mapfile -t route53_name_servers < <(jq -r '.DelegationSet.NameServers[]' <<<"$zone" | sort)
   mapfile -t public_name_servers < <(dig +short NS "${HOSTED_ZONE_NAME%.}" | sed 's/\.$//' | sort)
 
@@ -214,6 +243,8 @@ find_issued_certificate() {
   local certificates
   local -a matches=()
 
+  # CloudFront requires its ACM certificate in us-east-1. The eu-central-1
+  # certificate is separate and is used by regional Application Load Balancers.
   [[ "$CERTIFICATE_REGION" == "us-east-1" ]] ||
     die "CloudFront certificate Region must be us-east-1, not $CERTIFICATE_REGION"
 
@@ -275,6 +306,8 @@ verify_target_bucket() {
     --bucket "$TARGET_BUCKET" \
     --expected-bucket-owner "$TARGET_ACCOUNT_ID")"
 
+  # S3 stays private. migrate-s3-buckets.sh later grants access only to this
+  # CloudFront distribution through an OAC-scoped bucket policy.
   jq -e '
     .PublicAccessBlockConfiguration |
     .BlockPublicAcls == true and
@@ -328,6 +361,7 @@ ensure_ownership_txt() {
     die "Multiple TXT record sets unexpectedly match '$OWNERSHIP_TXT_NAME'"
   fi
 
+  # Reuse an exact value, but never overwrite a TXT owned by something else.
   if [[ "$(jq 'length' <<<"$record_set")" -eq 1 ]]; then
     if jq -e --arg value "$expected_value" '.[0].ResourceRecords | any(.Value == $value)' <<<"$record_set" >/dev/null; then
       log "Verified ownership TXT $OWNERSHIP_TXT_NAME -> $DISTRIBUTION_DOMAIN"
@@ -373,6 +407,8 @@ ensure_ownership_txt() {
   log "Created ownership TXT $OWNERSHIP_TXT_NAME -> $DISTRIBUTION_DOMAIN"
 }
 
+# The S3 origin identifies an earlier run. Finding and validating it makes this
+# preparation idempotent instead of creating duplicate distributions.
 find_distribution_by_origin() {
   local distributions
   local -a matches=()
@@ -502,6 +538,8 @@ create_oac() {
   local config_file="$WORK_DIR/oac-config.json"
   local result
 
+  # OAC replaces public S3 access: CloudFront signs each origin request with
+  # SigV4, and the S3 policy trusts only the target distribution.
   jq -n \
     --arg name "$OAC_NAME" \
     --arg description "Private S3 access for $TARGET_BUCKET" \
@@ -525,6 +563,8 @@ create_oac() {
 render_distribution_config() {
   local config_file="$1"
 
+  # Preserve required SPA behavior with a private S3 REST origin. Mapping 403/404
+  # to index.html allows browser refreshes on client-side routes.
   jq -n \
     --arg caller_reference "$CALLER_REFERENCE" \
     --arg origin_id "$ORIGIN_ID" \
@@ -672,6 +712,8 @@ main() {
   WORK_DIR="$(mktemp -d -t wallet-cloudfront.XXXXXX)"
   chmod 700 "$WORK_DIR"
 
+  # Complete all read-only safety gates before creating or reusing resources.
+  # With --dry-run, execution stops before every AWS write.
   verify_target_account
   verify_source_account
   verify_authoritative_zone
@@ -680,6 +722,7 @@ main() {
   verify_target_bucket
   find_distribution_by_origin
 
+  # Validate and reuse a previous matching distribution instead of duplicating it.
   if [[ -n "$DISTRIBUTION_ID" ]]; then
     validate_existing_distribution
     ensure_ownership_txt
