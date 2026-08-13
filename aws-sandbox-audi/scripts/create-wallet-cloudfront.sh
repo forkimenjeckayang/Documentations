@@ -60,6 +60,8 @@ DISTRIBUTION_DOMAIN=""
 DISTRIBUTION_STATUS=""
 CERTIFICATE_ARN=""
 DNS_CHANGE_COUNT=0
+ALIAS_STATE=""
+TARGET_ALIAS_DISTRIBUTION_ID=""
 
 usage() {
   cat <<'EOF'
@@ -74,7 +76,8 @@ us-east-1. After creation, the script creates or verifies the cross-account
 ownership TXT record in the authoritative sandbox Route 53 zone.
 
 It does not move wallet.solutions.adorsys.com, change its production A record, or
-modify the source distribution. Those actions belong to the later cutover.
+modify the source distribution. It accepts both the preparation state (exact alias
+on source) and completed-cutover state (exact alias on the matching target).
 
 Options:
   --dry-run  Perform read-only checks and report CREATE or REUSE actions.
@@ -205,37 +208,63 @@ verify_authoritative_zone() {
 }
 
 verify_source_alias_state() {
-  local distributions
-  local -a exact_matches=()
-  local -a wildcard_matches=()
+  local source_distributions
+  local target_distributions
+  local -a source_exact_matches=()
+  local -a source_wildcard_matches=()
+  local -a target_exact_matches=()
 
-  distributions="$(aws cloudfront list-distributions \
+  source_distributions="$(aws cloudfront list-distributions \
     --profile "$SOURCE_PROFILE" \
     --output json)"
+  target_distributions="$(aws cloudfront list-distributions \
+    --profile "$TARGET_PROFILE" \
+    --output json)"
 
-  mapfile -t exact_matches < <(
+  mapfile -t source_exact_matches < <(
     jq -r --arg alias "$WALLET_DOMAIN" '
       .DistributionList.Items[]? |
       select(any(.Aliases.Items[]?; . == $alias)) |
       .Id
-    ' <<<"$distributions"
+    ' <<<"$source_distributions"
   )
-  mapfile -t wildcard_matches < <(
+  mapfile -t source_wildcard_matches < <(
     jq -r --arg alias "$WILDCARD_ALIAS" '
       .DistributionList.Items[]? |
       select(any(.Aliases.Items[]?; . == $alias)) |
       .Id
-    ' <<<"$distributions"
+    ' <<<"$source_distributions"
+  )
+  mapfile -t target_exact_matches < <(
+    jq -r --arg alias "$WALLET_DOMAIN" '
+      .DistributionList.Items[]? |
+      select(any(.Aliases.Items[]?; . == $alias)) |
+      .Id
+    ' <<<"$target_distributions"
   )
 
-  ((${#exact_matches[@]} == 1)) ||
-    die "Expected exactly one source distribution with alias '$WALLET_DOMAIN', found: ${exact_matches[*]:-none}"
-  [[ "${exact_matches[0]}" == "$SOURCE_DISTRIBUTION_ID" ]] ||
-    die "Alias '$WALLET_DOMAIN' is on source distribution '${exact_matches[0]}', expected '$SOURCE_DISTRIBUTION_ID'"
-  ((${#wildcard_matches[@]} == 0)) ||
-    die "Source account already uses wildcard alias '$WILDCARD_ALIAS' on: ${wildcard_matches[*]}"
+  ((${#source_wildcard_matches[@]} == 0)) ||
+    die "Source account uses conflicting wildcard alias '$WILDCARD_ALIAS' on: ${source_wildcard_matches[*]}"
 
-  log "Verified production alias remains on source distribution $SOURCE_DISTRIBUTION_ID"
+  if ((${#source_exact_matches[@]} == 1)); then
+    [[ "${source_exact_matches[0]}" == "$SOURCE_DISTRIBUTION_ID" ]] ||
+      die "Alias '$WALLET_DOMAIN' is on source distribution '${source_exact_matches[0]}', expected '$SOURCE_DISTRIBUTION_ID'"
+    ((${#target_exact_matches[@]} == 0)) ||
+      die "Alias '$WALLET_DOMAIN' unexpectedly appears in both accounts; target matches: ${target_exact_matches[*]}"
+
+    ALIAS_STATE="pre-cutover"
+    log "Verified pre-cutover state: production alias remains on source distribution $SOURCE_DISTRIBUTION_ID"
+  elif ((${#source_exact_matches[@]} == 0)); then
+    ((${#target_exact_matches[@]} == 1)) ||
+      die "Alias '$WALLET_DOMAIN' is absent from source and expected on exactly one target distribution; found: ${target_exact_matches[*]:-none}"
+
+    TARGET_ALIAS_DISTRIBUTION_ID="${target_exact_matches[0]}"
+    ALIAS_STATE="post-cutover"
+    log "Verified post-cutover state: production alias is absent from source and present on target distribution $TARGET_ALIAS_DISTRIBUTION_ID"
+  else
+    die "Alias '$WALLET_DOMAIN' appears on multiple source distributions: ${source_exact_matches[*]}"
+  fi
+
   log "Verified source account has no conflicting wildcard alias $WILDCARD_ALIAS"
 }
 
@@ -686,13 +715,20 @@ print_result() {
   printf 'CLOUDFRONT_STATUS=%s\n' "$DISTRIBUTION_STATUS"
   printf 'CLOUDFRONT_PREPARATION_ALIAS=%s\n' "$WILDCARD_ALIAS"
   printf 'OWNERSHIP_TXT=%s -> %s\n' "$OWNERSHIP_TXT_NAME" "$DISTRIBUTION_DOMAIN"
-  printf '\nNext, validate and apply the S3 OAC policy:\n'
-  printf 'scripts/migrate-s3-buckets.sh --dry-run --wallet-cloudfront-distribution-id %q\n' "$DISTRIBUTION_ID"
-  printf 'scripts/migrate-s3-buckets.sh --wallet-cloudfront-distribution-id %q\n' "$DISTRIBUTION_ID"
-  printf '\nWait for deployment, then create a temporary DNS alias such as\n'
-  printf 'wallet-migration.solutions.adorsys.com -> %s and test through that hostname.\n' "$DISTRIBUTION_DOMAIN"
-  printf 'aws cloudfront wait distribution-deployed --profile %q --id %q\n' "$TARGET_PROFILE" "$DISTRIBUTION_ID"
-  printf '\nProduction is unchanged: %s still belongs to source distribution %s.\n' "$WALLET_DOMAIN" "$SOURCE_DISTRIBUTION_ID"
+  if [[ "$ALIAS_STATE" == "pre-cutover" ]]; then
+    printf '\nNext, validate and apply the S3 OAC policy:\n'
+    printf 'scripts/migrate-s3-buckets.sh --dry-run --wallet-cloudfront-distribution-id %q\n' "$DISTRIBUTION_ID"
+    printf 'scripts/migrate-s3-buckets.sh --wallet-cloudfront-distribution-id %q\n' "$DISTRIBUTION_ID"
+    printf '\nWait for deployment, then create a temporary DNS alias such as\n'
+    printf 'wallet-migration.solutions.adorsys.com -> %s and test through that hostname.\n' "$DISTRIBUTION_DOMAIN"
+    printf 'aws cloudfront wait distribution-deployed --profile %q --id %q\n' "$TARGET_PROFILE" "$DISTRIBUTION_ID"
+    printf '\nProduction is unchanged: %s still belongs to source distribution %s.\n' "$WALLET_DOMAIN" "$SOURCE_DISTRIBUTION_ID"
+  else
+    printf '\nPost-cutover state verified: %s belongs to target distribution %s.\n' "$WALLET_DOMAIN" "$DISTRIBUTION_ID"
+    printf 'No CloudFront alias or production DNS cutover action is required.\n'
+    printf 'Optional S3/OAC verification:\n'
+    printf 'scripts/migrate-s3-buckets.sh --dry-run --wallet-cloudfront-distribution-id %q\n' "$DISTRIBUTION_ID"
+  fi
   log "DNS records created by this run: $DNS_CHANGE_COUNT"
   log "Execution log: $LOG_FILE"
 }
@@ -721,6 +757,15 @@ main() {
   find_issued_certificate
   verify_target_bucket
   find_distribution_by_origin
+
+  # After cutover, prove that the exact alias and expected S3 origin belong to
+  # the same target distribution before allowing reuse.
+  if [[ "$ALIAS_STATE" == "post-cutover" ]]; then
+    [[ -n "$DISTRIBUTION_ID" ]] ||
+      die "Target alias is on $TARGET_ALIAS_DISTRIBUTION_ID, but no target distribution uses origin '$ORIGIN_DOMAIN'"
+    [[ "$DISTRIBUTION_ID" == "$TARGET_ALIAS_DISTRIBUTION_ID" ]] ||
+      die "Target alias is on $TARGET_ALIAS_DISTRIBUTION_ID, but wallet origin '$ORIGIN_DOMAIN' is on $DISTRIBUTION_ID"
+  fi
 
   # Validate and reuse a previous matching distribution instead of duplicating it.
   if [[ -n "$DISTRIBUTION_ID" ]]; then
