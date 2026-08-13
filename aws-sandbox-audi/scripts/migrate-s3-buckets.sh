@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 
+# Idempotently copy the wallet buckets from the sandbox to the target account.
+# This script never deletes or modifies source objects.
+#
+# Target access models:
+#   wallet-react-app-main     private; CloudFront reads it through OAC
+#   wallet-app-metadata-main direct public GetObject access; no CloudFront
+#
+# Run with --dry-run first. Real reruns compare content, metadata, and tags and
+# skip objects that are already identical.
+
 set -Eeuo pipefail
 
 readonly SOURCE_ACCOUNT_ID="${SOURCE_ACCOUNT_ID:-917848404243}"
@@ -82,6 +92,8 @@ initialize_logging() {
     mode="dry-run"
   fi
 
+  # Logs can contain AWS identifiers and object keys. Keep them private and out
+  # of Git; .migration-logs/ is listed in the repository's .gitignore.
   mkdir -p -- "$LOG_DIR"
   chmod 700 "$LOG_DIR"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -133,6 +145,7 @@ verify_accounts() {
   actual_source_account="$(account_for_profile "$SOURCE_PROFILE")"
   actual_target_account="$(account_for_profile "$TARGET_PROFILE")"
 
+  # Fail before any writes if either profile points to an unexpected account.
   [[ "$actual_source_account" == "$SOURCE_ACCOUNT_ID" ]] ||
     die "Profile '$SOURCE_PROFILE' resolves to $actual_source_account, expected $SOURCE_ACCOUNT_ID"
 
@@ -170,6 +183,8 @@ target_bucket_preflight() {
   local bucket_region
   local head_output
 
+  # S3 names are global. Reuse only a bucket owned by the expected target
+  # account; otherwise confirm that the selected new name is available.
   if target_bucket_is_owned_by_target "$bucket"; then
     bucket_region="$(aws s3api get-bucket-location \
       --profile "$TARGET_PROFILE" \
@@ -236,6 +251,8 @@ harden_target_bucket() {
   local access_mode="$2"
   local public_access_configuration
 
+  # Public ACLs are blocked for both buckets. Metadata uses a deliberate public
+  # bucket policy; wallet application files remain private behind CloudFront.
   case "$access_mode" in
     private)
       public_access_configuration='BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
@@ -286,6 +303,8 @@ validate_cloudfront_distribution_for_bucket() {
   local distribution
   local expected_arn="arn:aws:cloudfront::$TARGET_ACCOUNT_ID:distribution/$distribution_id"
 
+  # Grant access only after proving the distribution belongs to the target
+  # account and uses this bucket as an origin.
   [[ "$distribution_id" =~ ^E[A-Z0-9]+$ ]] ||
     die "Invalid CloudFront distribution ID for '$bucket': $distribution_id"
 
@@ -305,6 +324,8 @@ validate_cloudfront_distribution_for_bucket() {
   log "Verified target CloudFront distribution $distribution_id for $bucket"
 }
 
+# The generated policy uses SourceArn so only the selected target distribution,
+# rather than every CloudFront distribution, can read the wallet bucket.
 configure_cloudfront_bucket_policy() {
   local bucket="$1"
   local distribution_id="$2"
@@ -372,6 +393,8 @@ configure_cloudfront_bucket_policy() {
   log "Applied OAC-restricted CloudFront bucket policy: $bucket -> $distribution_id"
 }
 
+# Metadata does not use CloudFront. Its public policy is deliberately limited to
+# GetObject on this target bucket's objects.
 configure_metadata_public_read_policy() {
   local bucket="$1"
   local policy_error_file="$MIGRATION_TMP_DIR/policy-$bucket.err"
@@ -538,6 +561,8 @@ sync_object_tags() {
   fi
 }
 
+# ETags are not always reliable equality checks. Download and compare bytes, then
+# independently compare HTTP metadata and object tags.
 copy_object_if_needed() {
   local source_bucket="$1"
   local target_bucket="$2"
@@ -666,6 +691,8 @@ verify_bucket_copy() {
   source_inventory="$(bucket_inventory "$SOURCE_PROFILE" "$SOURCE_ACCOUNT_ID" "$SOURCE_REGION" "$source_bucket")"
   target_inventory="$(bucket_inventory "$TARGET_PROFILE" "$TARGET_ACCOUNT_ID" "$TARGET_REGION" "$target_bucket")"
 
+  # Per-object bytes are checked during copying; this completeness gate also
+  # requires matching object counts and total bytes.
   [[ "$source_inventory" == "$target_inventory" ]] ||
     die "Inventory mismatch for $source_bucket -> $target_bucket: source=[$source_inventory], target=[$target_inventory]"
 
@@ -718,6 +745,7 @@ main() {
     fi
   done
 
+  # Dry-run exits before bucket creation, policy changes, or object uploads.
   if [[ "$DRY_RUN" == true ]]; then
     log "DRY RUN RESULT: PASS - all read-only preflight checks succeeded."
     log "No buckets or objects were changed."

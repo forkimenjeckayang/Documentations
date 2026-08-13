@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 
+# Prepare the two target-account wildcard certificates required by the migration:
+#   eu-central-1 -> regional ALBs for nginx and Keycloak
+#   us-east-1    -> the global CloudFront wallet distribution
+#
+# DNS validation records are written to the sandbox Route 53 zone because it is
+# still publicly authoritative for solutions.adorsys.com. Certificates can belong
+# to the target account while validation DNS remains in the source account.
+
 set -Eeuo pipefail
 
 readonly SOURCE_ACCOUNT_ID="${SOURCE_ACCOUNT_ID:-917848404243}"
@@ -94,6 +102,8 @@ initialize_logging() {
     mode="dry-run"
   fi
 
+  # Logs provide the certificate/validation audit trail. Keep them private and
+  # excluded from Git under .migration-logs/.
   mkdir -p -- "$LOG_DIR"
   chmod 700 "$LOG_DIR"
   timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -115,6 +125,7 @@ verify_accounts() {
   actual_source="$(account_for_profile "$SOURCE_PROFILE")"
   actual_target="$(account_for_profile "$TARGET_PROFILE")"
 
+  # Verify both profiles before requesting certificates or changing Route 53.
   [[ "$actual_source" == "$SOURCE_ACCOUNT_ID" ]] ||
     die "Profile '$SOURCE_PROFILE' resolves to $actual_source, expected $SOURCE_ACCOUNT_ID"
   [[ "$actual_target" == "$TARGET_ACCOUNT_ID" ]] ||
@@ -137,6 +148,8 @@ verify_authoritative_zone() {
   [[ "$(jq -r '.HostedZone.Config.PrivateZone' <<<"$zone")" == "false" ]] ||
     die "Hosted zone '$HOSTED_ZONE_ID' is private"
 
+  # A duplicate hosted zone may exist without public delegation. ACM sees only
+  # public DNS, so validation must be written to the authoritative zone.
   mapfile -t route53_name_servers < <(jq -r '.DelegationSet.NameServers[]' <<<"$zone" | sort)
   mapfile -t public_name_servers < <(dig +short NS "${HOSTED_ZONE_NAME%.}" | sed 's/\.$//' | sort)
 
@@ -148,6 +161,8 @@ verify_authoritative_zone() {
   log "Verified authoritative public zone $HOSTED_ZONE_ID using profile $SOURCE_PROFILE"
 }
 
+# Reuse a pending or issued match. Multiple matches are ambiguous, so the script
+# stops instead of selecting a certificate unpredictably.
 find_certificate() {
   local region="$1"
   local certificates
@@ -176,6 +191,7 @@ find_certificate() {
   fi
 }
 
+# Region-specific ACM idempotency tokens protect retries from duplicate requests.
 request_certificate() {
   local region="$1"
   local token="$2"
@@ -198,6 +214,7 @@ describe_validation() {
   local attempt
   local certificate
 
+  # ACM may take a few seconds after a request to publish its validation CNAME.
   for attempt in {1..12}; do
     certificate="$(aws acm describe-certificate \
       --profile "$TARGET_PROFILE" \
@@ -234,6 +251,7 @@ validation_record_state() {
   existing_type="$(jq -r '.ResourceRecordSets[0].Type // empty' <<<"$existing")"
   existing_value="$(jq -r '.ResourceRecordSets[0].ResourceRecords[0].Value // empty' <<<"$existing")"
 
+  # Never overwrite a conflicting value; it may validate another AWS resource.
   if [[ "$existing_name" != "$name" ]]; then
     printf 'missing\n'
   elif [[ "$existing_type" == "CNAME" && "$existing_value" == "$value" ]]; then
@@ -286,6 +304,8 @@ process_region() {
   local validation_value
   local record_state
 
+  # Process Regions independently because ACM certificates are regional even
+  # though both certificates cover the same wildcard domain.
   certificate_arn="$(find_certificate "$region")"
 
   if [[ -z "$certificate_arn" ]]; then
@@ -372,6 +392,7 @@ main() {
   done
 
   printf '\n'
+  # Dry-run performs discovery only and makes no ACM or Route 53 changes.
   if [[ "$DRY_RUN" == true ]]; then
     log "DRY RUN RESULT: PASS - both target certificate plans are valid"
     log "No AWS resources were changed"
