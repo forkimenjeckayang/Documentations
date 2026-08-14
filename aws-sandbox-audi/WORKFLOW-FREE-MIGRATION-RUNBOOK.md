@@ -5,7 +5,8 @@
 - **Source Region:** `eu-north-1`
 - **Target Region:** `eu-central-1`, except CloudFront certificates in `us-east-1`
 - **Purpose:** Migrate the remaining sandbox workloads without running repository workflows
-- **Status:** Instructions only; every write operation requires an approved migration window
+- **Status:** Wallet and nginx are migrated; the target Keycloak stack and
+  owner-accepted database state are healthy before cutover; Keycloak DNS remains
 
 ## 1. Short Answer
 
@@ -43,8 +44,8 @@ Keycloak database only after every target component has passed isolated testing.
 | 4 | Initial-copy both S3 buckets | None |
 | 5 | Recreate CloudFront with a temporary wildcard alias and test through a temporary hostname | None |
 | 6 | Recreate nginx ECS and test the target ALB with `curl --connect-to` | None |
-| 7 | Create a baseline Keycloak AMI, copy it to the target, and launch an isolated target instance | One controlled source reboot |
-| 8 | Restore a rehearsal PostgreSQL dump and test Keycloak through a temporary hostname | No production change |
+| 7 | Create a no-reboot baseline Keycloak AMI, copy it to the target, prepare the target foundation, and launch an isolated target instance | None |
+| 8 | Restore a rehearsal PostgreSQL dump and test Keycloak through the target ALB with production SNI/Host using `curl --connect-to` | No production change |
 | 9 | Lower DNS TTLs and run the final S3 sync | None |
 | 10 | Cut over the stateless nginx proxy | Short DNS propagation only |
 | 11 | Stop Keycloak writes, take the final PostgreSQL dump, restore it, and cut over Keycloak | Planned Keycloak maintenance |
@@ -134,6 +135,25 @@ only in a restricted migration location and never in this repository.
 
 ## 5. Is an AMI Enough for Keycloak and PostgreSQL?
 
+### Verified Source Layout
+
+The 2026-08-14 verification established the actual source layout:
+
+- EC2 `i-03eac5cc262731ede` is a running x86_64 `t3.medium`.
+- It has one 100-GiB unencrypted gp3 root EBS volume and no separate data disk.
+- Docker root is `/var/lib/docker`, which is on the root filesystem.
+- PostgreSQL uses named volume `oid4vci-deployment_db_data` at
+  `/var/lib/docker/volumes/oid4vci-deployment_db_data/_data`.
+- PostgreSQL is the Docker Compose `db` service.
+- Keycloak is not a container in the active host-mode deployment. It is started
+  from `oid4vci-deployment` with `./keycloak-ssi.sh setup -d`.
+- That command starts PostgreSQL, publishes container port 5432 as host port 5433,
+  injects the provider JARs, and starts host `bin/kc.sh` against
+  `localhost:5433`.
+- The current Compose file has no restart policy, and detached host Keycloak is not
+  managed by systemd. Neither service should be assumed to recover automatically
+  after a reboot until a boot-time service is added and tested.
+
 ### What the AMI Copies
 
 For this host, a baseline AMI is a good way to reproduce the machine configuration
@@ -182,231 +202,347 @@ copying, launching, and account-specific corrections all occur inside the outage
 
 ### 6.1 Prepare the Source Host
 
-1. Take and checksum a rehearsal PostgreSQL backup as described in section 7.
-2. Confirm that all durable files are on EBS-backed paths.
-3. Record attached volumes and their mount points.
-4. Stop Keycloak cleanly so no new database writes are accepted.
-5. Stop PostgreSQL cleanly after the backup.
-6. Run `sync` on the host.
-7. Confirm both processes have stopped.
+Do not stop the production service for the baseline image. First create an online,
+transactionally consistent PostgreSQL dump using section 7.1, checksum it, and copy
+it to restricted storage outside this EC2 instance.
 
-Use the appropriate service mechanism discovered during inventory:
+Then confirm:
 
-```bash
-# Systemd examples
-sudo systemctl stop keycloak
-sudo systemctl stop postgresql
-sudo sync
+1. `docker info --format '{{.DockerRootDir}}'` returns `/var/lib/docker`.
+2. `findmnt -T /var/lib/docker` shows the root EBS filesystem.
+3. `docker volume inspect oid4vci-deployment_db_data` shows the expected mount.
+4. `pgrep -af 'bin/kc.sh'` shows host Keycloak.
+5. `docker ps` shows the PostgreSQL container.
+6. The off-instance dump checksum matches its source checksum.
 
-# Docker examples; use the real names discovered during inventory
-docker stop <keycloak-container>
-docker stop <postgres-container>
-sudo sync
-```
+The live AMI is a machine baseline, not the authoritative final database transfer.
+Its PostgreSQL files are only crash-consistent. The checked logical dump protects
+the database independently.
 
 ### 6.2 Create the AMI in the Source Account
 
-The in-scope source instance is `i-03eac5cc262731ede`.
+Use the idempotent migration script from the documentation repository:
 
 ```bash
-export SOURCE_INSTANCE_ID=i-03eac5cc262731ede
-export AMI_NAME=keycloak-demo-baseline-20260811
+chmod +x scripts/migrate-keycloak-ec2.sh
 
-aws ec2 create-image \
-  --profile sandbox \
-  --region "$SOURCE_REGION" \
-  --instance-id "$SOURCE_INSTANCE_ID" \
-  --name "$AMI_NAME" \
-  --description "Keycloak and PostgreSQL migration baseline" \
-  --tag-specifications \
-    'ResourceType=image,Tags=[{Key=Name,Value=keycloak-demo-migration},{Key=Purpose,Value=account-migration}]' \
-  --query ImageId \
-  --output text
+./scripts/migrate-keycloak-ec2.sh --dry-run
 ```
 
-Do not add `--no-reboot`. The default controlled reboot gives AWS a consistent file
-system. Because the services were stopped first, PostgreSQL is also cleanly closed.
-After the source instance returns, explicitly confirm that PostgreSQL and Keycloak
-are running and that the source ALB works.
-
-Wait for the AMI to become available:
+Review the ignored, mode-0600 log under `.migration-logs/`. After verifying the
+off-instance PostgreSQL dump:
 
 ```bash
-aws ec2 wait image-available \
-  --profile sandbox \
-  --region "$SOURCE_REGION" \
-  --image-ids <source-ami-id>
+./scripts/migrate-keycloak-ec2.sh \
+  --prepare-ami \
+  --execute \
+  --backup-confirmed
 ```
+
+The script creates or reuses source AMI
+`keycloak-demo-migration-baseline-20260814` with `--no-reboot`. The source
+instance, Keycloak process, PostgreSQL container, ALB, and DNS remain unchanged.
+
+The script waits until the image is available and prints each backing snapshot's
+state and percentage while it waits. The default timeout is four hours because the
+AWS CLI's approximately ten-minute built-in waiter can be too short for this
+100-GiB image. Re-running the same command reuses the same AMI instead of creating
+another one. To intentionally create a new version, provide new
+`SOURCE_AMI_NAME` and `TARGET_AMI_NAME` environment values.
 
 ### 6.3 Share the Source AMI for a Target-Owned Copy
 
-The verified source root EBS volume is currently unencrypted, which avoids the
-cross-account KMS restriction at the sharing stage. Verify this again before use.
+The script verifies again that the source root snapshot is unencrypted. It then
+idempotently grants only target account `982081049921`:
+
+- AMI launch permission
+- Create-volume permission on every backing snapshot
+
+It never grants public access. If the source becomes encrypted, the script stops
+instead of attempting an unsafe or incomplete KMS share.
+
+Inspect the result at any time:
 
 ```bash
-aws ec2 describe-images \
-  --profile sandbox \
-  --region "$SOURCE_REGION" \
-  --image-ids <source-ami-id> \
-  --query 'Images[0].BlockDeviceMappings[].Ebs.SnapshotId'
+./scripts/migrate-keycloak-ec2.sh --status
 ```
-
-Grant target launch permission on the AMI:
-
-```bash
-aws ec2 modify-image-attribute \
-  --profile sandbox \
-  --region "$SOURCE_REGION" \
-  --image-id <source-ami-id> \
-  --launch-permission "Add=[{UserId=$TARGET_ACCOUNT_ID}]"
-```
-
-To allow the target account to make its own AMI copy, grant create-volume permission
-on every unencrypted backing snapshot:
-
-```bash
-aws ec2 modify-snapshot-attribute \
-  --profile sandbox \
-  --region "$SOURCE_REGION" \
-  --snapshot-id <source-snapshot-id> \
-  --attribute createVolumePermission \
-  --operation-type add \
-  --user-ids "$TARGET_ACCOUNT_ID"
-```
-
-If any snapshot is encrypted, it cannot be shared when it uses the AWS-managed
-`aws/ebs` key. First make a source copy encrypted with a customer-managed KMS key,
-grant the target account use of that key, and then share the AMI. Never make the AMI
-or snapshot public.
 
 ### 6.4 Copy and Encrypt the AMI in the Target Account
 
-Copying makes the target account the owner of an independent AMI. Encrypt the target
-copy even though the source disk is unencrypted.
+In the same `--prepare-ami` run, profile `default` copies or reuses the shared
+source image as `keycloak-demo-migration-target-20260814` in
+`eu-central-1`. The copy is:
+
+- Owned independently by target account `982081049921`
+- Encrypted at rest
+- Tagged with the migration name and stage
+- Verified only after every target snapshot reports encryption
+
+The script prints the target AMI ID needed for launch. It deliberately leaves the
+EC2 launch manual so the operator can review the launch summary and choose whether
+to attach a key pair. A key pair is optional when Systems Manager is the approved
+access path.
+
+After the target-owned image is verified and no further copy is needed, remove the
+temporary source sharing:
 
 ```bash
-aws ec2 copy-image \
-  --profile default \
-  --region "$TARGET_REGION" \
-  --source-region "$SOURCE_REGION" \
-  --source-image-id <source-ami-id> \
-  --name keycloak-demo-target-20260811 \
-  --description "Target-owned encrypted Keycloak migration image" \
-  --encrypted \
-  --query ImageId \
-  --output text
-
-aws ec2 wait image-available \
-  --profile default \
-  --region "$TARGET_REGION" \
-  --image-ids <target-ami-id>
+./scripts/migrate-keycloak-ec2.sh --revoke-share --execute
 ```
 
-Use `--kms-key-id <target-key-arn>` when the target account requires a specific
-customer-managed key. Otherwise, the target account's applicable EBS encryption
-default is used.
+This revokes only the cross-account source permissions. It does not modify the
+target-owned AMI.
 
-### 6.5 Launch in the Existing Target Infrastructure
+### 6.5 Prepare the Target Foundation and Launch EC2 Manually
 
-Launch the target-owned AMI using:
+First inspect the target account without making changes:
 
-- The existing approved target subnet
-- An application-specific target security group
-- The target EC2 instance profile
-- `t3.medium` initially, matching the source architecture and size
-- Encrypted EBS volumes
-- IMDSv2 required with response hop limit 2 for container compatibility
-- No public PostgreSQL port
+```bash
+./scripts/migrate-keycloak-ec2.sh --target-status
+```
 
-Do not register it with the production target group yet. First isolate it and:
+Then create or reuse the supporting target resources:
 
-1. Replace source-account ECR URIs with target ECR URIs.
-2. Replace source-account ARNs and log destinations.
-3. Remove embedded AWS credentials and obsolete SSH keys.
-4. Move secret values to the approved target secret store.
-5. Confirm hostname and proxy settings without changing the public issuer URL.
-6. Confirm file permissions and volume mounts.
-7. Disable outbound calls to source services unless explicitly required for testing.
-8. Start PostgreSQL, restore the rehearsal dump, and then start Keycloak.
-9. Test through a temporary ALB hostname.
+```bash
+./scripts/migrate-keycloak-ec2.sh --prepare-target --execute
+```
+
+This mode is idempotent. It validates the existing VPC/subnets, NAT route, target
+AMI, and issued wildcard certificate, then creates or reuses:
+
+- IAM role and instance profile `keycloak-demo-ec2-role` with Systems Manager access
+- Public-HTTPS ALB security group `keycloak-demo-alb-sg`
+- EC2 security group `keycloak-demo-ec2-sg`, allowing port 80 only from the ALB
+- HTTP target group `keycloak-demo-targets`, with health path `/realms/master`
+- New internet-facing ALB `keycloak-demo-migration`
+- HTTPS listener on port 443 using the issued target wildcard certificate
+
+#### What These Resources Are and Why They Exist
+
+| Resource | What it is | Why this migration needs it |
+|---|---|---|
+| IAM role `keycloak-demo-ec2-role` | An IAM identity trusted by the EC2 service. The script attaches the AWS-managed `AmazonSSMManagedInstanceCore` policy. | Gives the SSM Agent running on the instance temporary AWS credentials so it can register as a managed node, open Session Manager data channels, and report its status. Credentials come from the instance metadata service; they are not stored in the AMI. |
+| Instance profile `keycloak-demo-ec2-role` | The EC2 attachment container for the IAM role. An IAM role cannot be selected directly in the EC2 launch form; EC2 attaches its instance profile. | Connects the role to the manually launched EC2 instance. Select this value under **IAM instance profile** during launch. |
+| ALB security group `keycloak-demo-alb-sg` | Network firewall attached to the new load balancer. | Allows public HTTPS on port 443. It is the only public entry point for Keycloak. |
+| EC2 security group `keycloak-demo-ec2-sg` | Network firewall attached to the Keycloak EC2 instance. | Allows HTTP port 80 only when traffic comes from the ALB security group. It does not expose PostgreSQL, Keycloak 8443, or SSH 22 to the internet. |
+| Target group `keycloak-demo-targets` | The ALB's list of backend instances and health-check configuration. | Sends ALB traffic to EC2 port 80, where host Nginx proxies to Keycloak on 8443. It checks `/realms/master` and accepts HTTP 200 as healthy. |
+| ALB `keycloak-demo-migration` | A new target-account Application Load Balancer in the existing public subnets. | Provides the stable public HTTPS endpoint while the EC2 instance remains in a private subnet. The source ALB is not copied or reused. |
+| HTTPS listener | The ALB rule accepting TLS connections on port 443. | Uses the issued target `*.solutions.adorsys.com` ACM certificate, terminates TLS, and forwards the request to `keycloak-demo-targets`. |
+
+The IAM role and instance profile are related but are not the same object:
+
+```text
+IAM role + AmazonSSMManagedInstanceCore policy
+                    |
+                    v
+             instance profile
+                    |
+                    v
+          manually launched EC2 instance
+                    |
+                    v
+               SSM Agent
+                    |
+       outbound HTTPS 443 through NAT
+                    |
+                    v
+        AWS Systems Manager service
+```
+
+The target EC2 instance has no public IP. The SSM Agent initiates the connection
+outbound through the private subnet's existing NAT route, so Session Manager does
+not require inbound port 22. For IDE access using SSH over an SSM tunnel, still
+select a key pair during EC2 launch and keep its private key locally. The tunnel
+reaches the instance through Session Manager; the EC2 security group can keep
+public port 22 closed.
+
+`AmazonSSMManagedInstanceCore` is the machine's permission to communicate with
+Systems Manager. It does not grant a person permission to connect. The developer's
+own IAM identity must separately be allowed to call `ssm:StartSession` and related
+session actions. The script does not modify human IAM permissions.
+
+The role also does not grant Keycloak access to application secrets, arbitrary S3
+buckets, or other AWS services. Add only the specific target-account permissions
+that the application proves it needs; do not put long-lived AWS credentials in the
+AMI or on disk.
+
+The application request path is separate from the management path:
+
+```text
+Client -> HTTPS 443 -> target ALB -> HTTP 80 -> host Nginx
+       -> local Keycloak 8443 -> PostgreSQL container on localhost:5433
+```
+
+It does not launch EC2, restore PostgreSQL, start Keycloak, register a target, or
+change DNS. At completion it prints the exact values to use in the EC2 console.
+
+Launch one instance manually with those printed values:
+
+- Target AMI `keycloak-demo-migration-target-20260814`
+- `t3.medium`
+- VPC `vpc-073150aef0868a8af`
+- Private subnet `subnet-01ea66e1eadb764b8`
+- No public IP
+- Security group `keycloak-demo-ec2-sg`
+- IAM instance profile `keycloak-demo-ec2-role`
+- 100 GiB encrypted gp3 root volume
+- IMDSv2 required, response hop limit 2
+- Tags `Name=Keycloak-demo-migration` and
+  `Migration=keycloak-demo-account-migration`
+- Termination protection enabled
+- A key pair only if the approved access method requires one; Systems Manager does
+  not require a key pair
+
+The source host's Nginx service is enabled and active. It is stored on the root EBS
+volume, so the AMI carries its configuration and enabled state; it should start on
+target boot. Confirm this with `systemctl is-active nginx` and verify it listens
+on port 80.
+
+Before registration, restore PostgreSQL, replace obsolete source credentials and
+account-specific settings, and start Keycloak with
+`./keycloak-ssi.sh setup -d`. Then run:
+
+```bash
+./scripts/migrate-keycloak-ec2.sh --register-target i-TARGET_INSTANCE_ID --execute
+```
+
+That mode validates the AMI, instance type, private network, security group,
+instance profile, tags, IMDSv2 settings, and encrypted root volume. It idempotently
+registers the instance on port 80, waits for `/realms/master` to return 200, and
+tests HTTPS through the new ALB using the production hostname for TLS SNI and the
+Host header without changing DNS.
 
 The public Keycloak hostname remains
-`https://keycloak-demo.solutions.adorsys.com`; only its DNS target changes later.
+`https://keycloak-demo.solutions.adorsys.com`; only its DNS target changes during
+the later explicit cutover.
+
+#### Current Target Checkpoint - 2026-08-14
+
+- Target-owned encrypted AMI: `ami-086507936442bb043`
+- Target IAM role and instance profile: `keycloak-demo-ec2-role`
+- Target ALB: `keycloak-demo-migration-1394321177.eu-central-1.elb.amazonaws.com`
+- Target EC2: `i-006ca4ea5780923de`, private IP `10.0.3.58`
+- Key pair: `keycloak-demo-migrated`
+- SSM managed-node status: `Online`
+- Root EBS: `vol-0bb12d848433aaea0`, 100 GiB gp3, encrypted
+- Target-group status: `healthy`; EC2 is registered on port 80
+- Verified project path: `/home/ubuntu/keycloak-oauth-sig/oid4vci-deployment`
+- Host Nginx: enabled, active, and listening on port 80
+- Docker: active; named volume `oid4vci-deployment_db_data` is present
+- Rehearsal backup checksums: verified `OK` before restore
+- PostgreSQL: rehearsal database restored from the logical custom-format dump
+- Host Keycloak: running on 8443; direct HTTPS and Nginx port 80 both return 200
+- Target ALB: production SNI/Host HTTPS test and OIDC discovery verified while
+  production DNS still points to the source
+
+The workload owner accepts the configuration copied through the AMI and the
+verified PostgreSQL restore on the target as the final migration state. This does
+not mean that the source database is unused. No additional transfer is required as
+long as the source configuration and database remain unchanged before DNS cutover.
+If either changes, repeat the relevant configuration and/or database transfer.
+
+Boot-time automation is intentionally deferred by the workload owner. This is an
+accepted operational risk for the current migration, not a DNS-cutover blocker.
+After an EC2 reboot or stop/start, an operator must connect through SSM and run
+`./keycloak-ssi.sh setup -d` from
+`~/keycloak-oauth-sig/oid4vci-deployment` before the ALB can become healthy again.
 
 ## 7. Transfer PostgreSQL Safely
 
 ### 7.1 Rehearsal Backup
 
-Stop Keycloak or otherwise block writes. PostgreSQL can remain running while its
-logical backup is taken.
+The rehearsal dump is online: Keycloak can continue serving traffic while
+`pg_dump` takes a transactionally consistent database snapshot.
 
-For a host-installed PostgreSQL service:
-
-```bash
-sudo -u postgres pg_dumpall --globals-only > keycloak-globals.sql
-sudo -u postgres pg_dump --format=custom --dbname=<keycloak-database> \
-  --file=keycloak-database.dump
-sha256sum keycloak-globals.sql keycloak-database.dump
-```
-
-For PostgreSQL in Docker:
+On the source EC2:
 
 ```bash
-docker exec <postgres-container> pg_dumpall \
-  --globals-only --username=<postgres-user> > keycloak-globals.sql
-docker exec <postgres-container> pg_dump \
-  --format=custom \
-  --username=<postgres-user> \
-  --dbname=<keycloak-database> > keycloak-database.dump
-sha256sum keycloak-globals.sql keycloak-database.dump
+cd ~/keycloak-oauth-sig/oid4vci-deployment
+mkdir -p ~/migration-backups
+chmod 700 ~/migration-backups
+
+DB_CONTAINER="$(docker ps \
+  --filter volume=oid4vci-deployment_db_data \
+  --format '{{.Names}}' | head -n1)"
+
+test -n "$DB_CONTAINER"
+docker exec "$DB_CONTAINER" pg_isready -U postgres -d keycloak
+
+docker exec "$DB_CONTAINER" \
+  pg_dumpall --globals-only --username=postgres \
+  > ~/migration-backups/keycloak-globals.sql
+
+docker exec "$DB_CONTAINER" \
+  pg_dump --format=custom --username=postgres --dbname=keycloak \
+  > ~/migration-backups/keycloak-rehearsal.dump
+
+chmod 600 ~/migration-backups/keycloak-globals.sql \
+  ~/migration-backups/keycloak-rehearsal.dump
+
+sha256sum ~/migration-backups/keycloak-globals.sql \
+  ~/migration-backups/keycloak-rehearsal.dump \
+  > ~/migration-backups/keycloak-rehearsal.sha256
 ```
 
-Do not put a password directly in the command or shell history. Use the existing
-restricted authentication mechanism. Store the dump with mode `0600`, encrypt it
-in transit and at rest, and never commit it.
+Copy all three files to restricted storage outside the EC2 instance, then run
+`sha256sum --check keycloak-rehearsal.sha256` there. Never commit the dumps or
+print the database password.
 
 ### 7.2 Restore Rehearsal
 
-Use the same PostgreSQL major version initially. On the isolated target:
+Launch an isolated target instance from the encrypted target AMI. Do not register
+it in the production target group and do not change production DNS.
 
-1. Stop target Keycloak.
-2. Start target PostgreSQL with an empty migration database.
-3. Restore required roles from `keycloak-globals.sql`.
-4. Restore the database dump with `pg_restore`.
-5. Start Keycloak.
-6. Validate realms, clients, users, sessions policy, signing material, and row counts.
+On the target:
 
-Example restore shape:
+1. Verify `oid4vci-deployment_db_data` exists.
+2. From `oid4vci-deployment`, run `./keycloak-ssi.sh compose up -d db` to
+   start PostgreSQL without starting public Keycloak.
+3. Back up the target's current database before testing a restore.
+4. Restore the rehearsal dump while target Keycloak is stopped.
+5. Run `./keycloak-ssi.sh setup -d`.
+6. Validate realms, users, clients, issuer keys, provider JARs, discovery, login,
+   token issuance, and OID4VC endpoints.
+7. Stop and start the target once more and prove the database persists.
+
+The restore command shape, after the container name is resolved as in section 7.1,
+is:
 
 ```bash
-psql --username=<postgres-admin> --file=keycloak-globals.sql postgres
-createdb --username=<postgres-admin> --owner=<keycloak-owner> <keycloak-database>
-pg_restore --username=<postgres-admin> \
-  --dbname=<keycloak-database> \
-  --no-owner \
-  --exit-on-error \
-  keycloak-database.dump
+docker exec -i "$DB_CONTAINER" \
+  pg_restore --username=postgres --dbname=keycloak \
+  --clean --if-exists --no-owner --exit-on-error \
+  < ~/migration-backups/keycloak-rehearsal.dump
 ```
 
-Adapt the commands if the target PostgreSQL is containerized. Do not start target
-Keycloak against the source database.
+This command replaces objects in the target `keycloak` database. Run it only on
+the isolated target after taking a target-side backup. Do not run it against the
+source database.
 
 ### 7.3 Final Database Cutover
 
-1. Announce the Keycloak maintenance window.
-2. Stop source Keycloak; leave source PostgreSQL running for the dump.
-3. Take a new globals backup and database dump.
-4. Generate and verify SHA-256 checksums after transfer.
-5. Stop target Keycloak.
-6. Replace the rehearsal target database with the final restored database.
-7. Start target PostgreSQL and Keycloak.
-8. Test the target temporary hostname and its ALB health.
-9. Change the production Keycloak DNS record only after validation passes.
-10. Keep source Keycloak stopped to prevent split-brain writes, but keep the source
-    instance recoverable for rollback.
+1. Announce the short Keycloak maintenance window.
+2. On the source, inspect `pgrep -af 'bin/kc.sh'` and stop only the verified
+   host Keycloak PID. Do not use `./keycloak-ssi.sh stop`: that command also
+   stops PostgreSQL.
+3. Confirm source port 8443 no longer accepts requests and the PostgreSQL container
+   is still healthy.
+4. Repeat the section 7.1 dump as `keycloak-final.dump` and calculate its
+   checksum.
+5. Transfer the final dump to the target and verify its checksum.
+6. Stop target Keycloak but leave target PostgreSQL running.
+7. Back up the current target database, then restore `keycloak-final.dump`
+   using the already rehearsed command.
+8. Start target services with `./keycloak-ssi.sh setup -d`.
+9. Test the target ALB with production SNI/Host before changing DNS.
+10. Change `keycloak-demo.solutions.adorsys.com` to the target ALB.
+11. Validate login, discovery, redirects, signing keys, and OID4VC endpoints.
+12. Keep source Keycloak stopped, while preserving its EC2 instance for rollback.
 
-If rollback is declared, stop target Keycloak before restarting source Keycloak.
-Never allow both installations to accept writes independently after cutover.
+Never let both independent databases accept production writes. Before target
+Keycloak accepts writes, rollback means stopping target Keycloak, restoring DNS,
+and restarting source Keycloak. After target writes begin, synchronize the target
+database back before any rollback.
 
 ## 8. Copy ECR Images Without a Repository Workflow
 
@@ -1156,22 +1292,25 @@ separate, optional project after the workloads are stable.
 
 ### During the Window
 
-1. Run the final S3 sync and verify it.
-2. Cut over nginx proxy DNS and validate wallet proxy calls. DNS cutover is
-   complete; full wallet-flow acceptance remains pending.
-3. Stop source Keycloak writes.
-4. Create, checksum, transfer, and restore the final PostgreSQL backup.
-5. Start and validate target Keycloak.
-6. Change Keycloak DNS and validate login, discovery, redirects, and OID4VC endpoints.
-7. Move the wallet CloudFront alias and DNS.
-8. Update and validate metadata URLs.
-9. Keep source Keycloak stopped after the successful stateful cutover.
+1. Completed: the final S3 sync was verified.
+2. Completed: nginx proxy DNS was cut over and its target health and CORS behavior
+   were verified.
+3. Confirm that the source configuration and database have not changed since the
+   accepted AMI/configuration copy and PostgreSQL backup. If either changed, repeat
+   the relevant configuration transfer and/or stop source writes and create,
+   checksum, transfer, restore, and verify a new final PostgreSQL dump.
+4. Revalidate target Keycloak and the healthy ALB target.
+5. Change Keycloak DNS and validate login, discovery, redirects, and OID4VC endpoints.
+6. Completed: the wallet CloudFront alias and DNS were moved to the target.
+7. Confirm and validate any remaining metadata consumer URL updates.
+8. Retain the source Keycloak stack during monitoring for rollback, while avoiding
+   source-side configuration or database changes that would create divergence.
 
 ### After the Window
 
 - [ ] Monitor target ALB, ECS, EC2, Keycloak, PostgreSQL, and CloudFront logs
 - [ ] Validate full wallet issuance and verification flows
-- [ ] Validate restart recovery for target EC2 and ECS
+- [x] Record the accepted manual Keycloak restart procedure and deferred boot-automation risk
 - [ ] Confirm target backup and restore procedures
 - [ ] Remove temporary cross-account S3 permissions
 - [ ] Remove AMI and snapshot sharing after the target owns its copy

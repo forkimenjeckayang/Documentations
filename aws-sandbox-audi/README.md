@@ -4,8 +4,9 @@
 **Source workload Region:** `eu-north-1`  
 **Target account:** `982081049921` (profile `default`)  
 **Target workload Region:** `eu-central-1`  
-**Last live source audit:** 2026-08-11 using read-only AWS CLI calls
-**Last live migration verification:** 2026-08-13 after nginx production cutover
+**Last live source audit:** 2026-08-14 using read-only AWS CLI calls
+
+**Last live migration verification:** 2026-08-14 after Keycloak target registration and HTTPS/OIDC verification
 
 This repository documents the remaining legacy-sandbox resources and their
 migration to the target AWS account. It does not create a new VPC; target resources
@@ -100,11 +101,34 @@ Interpretation:
 | [`scripts/prepare-target-certificates.sh`](scripts/prepare-target-certificates.sh) | Reuse or request target ALB and CloudFront certificates and ensure authoritative validation CNAMEs |
 | [`scripts/create-wallet-cloudfront.sh`](scripts/create-wallet-cloudfront.sh) | Idempotently prepare the wallet OAC, wildcard-enabled target distribution, and cross-account ownership TXT without moving production traffic |
 | [`scripts/migrate-nginx-proxy.sh`](scripts/migrate-nginx-proxy.sh) | Idempotently copy the nginx image, create/reuse target ECS and a new ALB, test without DNS changes, then perform an explicit cutover or rollback |
+| [`scripts/migrate-keycloak-ec2.sh`](scripts/migrate-keycloak-ec2.sh) | Prepare/copy the Keycloak AMI; create/reuse the target IAM profile, security groups, target group, new ALB, and HTTPS listener; then validate/register the manually launched EC2 without changing DNS |
 
-Always run a script with `--dry-run` first. Migration logs are written under
-`.migration-logs/`, use restrictive permissions, and are excluded by `.gitignore`.
+Use each script's read-only inspection before a mutating mode. For Keycloak, run
+`--dry-run` before `--prepare-ami`, and `--target-status` before
+`--prepare-target`. Migration logs are written under `.migration-logs/`, use
+restrictive permissions, and are excluded by `.gitignore`.
 Generated AWS inventory and repository-detection outputs are also ignored because
 they may contain task-definition environment data or sensitive AWS metadata.
+
+### Keycloak Migration Order
+
+1. Create, checksum, and copy the PostgreSQL rehearsal backup off the source EC2.
+2. Run `migrate-keycloak-ec2.sh --dry-run`.
+3. Run `--prepare-ami --execute --backup-confirmed` to create/share the source AMI
+   and produce the encrypted target-owned AMI.
+4. Run `--target-status`, then `--prepare-target --execute` to create/reuse the
+   IAM/SSM profile, security groups, target group, new ALB, and HTTPS listener.
+5. Manually launch EC2 with the AMI and exact settings printed by the script,
+   including the selected key pair. The script does not launch EC2.
+6. Connect through SSM, verify the copied files, restore PostgreSQL, and start
+   Keycloak with `./keycloak-ssi.sh setup -d`.
+7. Run `--register-target i-... --execute` to register the instance, wait for a
+   healthy target, and test HTTPS without changing production DNS.
+8. The workload owner accepts the configuration copied through the AMI and the
+   restored PostgreSQL backup on the target as the final migration state. If the
+   source configuration or database changes before cutover, repeat the relevant
+   configuration and/or database transfer; otherwise revalidate the target and
+   cut over DNS.
 
 ## Migration Progress
 
@@ -114,7 +138,7 @@ they may contain task-definition environment data or sensitive AWS metadata.
 | Metadata S3 data/policy | Migrated; consumer URL updates still require confirmation |
 | Target ACM certificates | Issued in `eu-central-1` and `us-east-1` |
 | nginx ECS/ECR/new ALB | Migrated; production DNS points to target ALB and workload is under monitoring |
-| Keycloak EC2/PostgreSQL/new ALB | Not yet migrated |
+| Keycloak EC2/PostgreSQL/new ALB | Target EC2 is running through SSM, the restored PostgreSQL backup is accepted by the workload owner as the final state, and Keycloak/OIDC are healthy behind the new HTTPS ALB; production DNS cutover remains |
 | Route 53 hosted zone | Remains authoritative in sandbox until workloads are stable |
 
 ## Current Migration Notes
@@ -143,5 +167,10 @@ they may contain task-definition environment data or sensitive AWS metadata.
   account. Post-cutover checks returned root HTTP 200 and CORS preflight 204;
   target ECS and ALB health are `1/1`. The source service remains running for
   rollback during monitoring.
+- Keycloak host verification on 2026-08-14 confirmed one unencrypted 100-GiB gp3
+  root EBS volume. Docker uses `/var/lib/docker` on that root filesystem, and the
+  PostgreSQL volume is `oid4vci-deployment_db_data`. PostgreSQL runs in Docker;
+  Keycloak runs on the EC2 host through `./keycloak-ssi.sh setup -d` and connects
+  to the published database port `localhost:5433`.
 
 Follow the runbook’s validation gates before deleting any source resource.

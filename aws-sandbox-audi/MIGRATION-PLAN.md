@@ -52,7 +52,7 @@ flowchart TD
 
     DNS -->|keycloak-demo| KALB[Keycloak load balancer]
     KALB --> KEC2[EC2 Keycloak-demo]
-    KEC2 --> KC[Keycloak container]
+    KEC2 --> KC[Keycloak host process]
     KEC2 --> DB[Database container]
     KECR[ECR: kc_wazuh and keycloak-wazuh] -. image .-> KEC2
 
@@ -188,9 +188,10 @@ restore procedure.
 
 ### Recovery AMI
 
-Create a baseline EC2 AMI after stopping Keycloak and PostgreSQL cleanly. Share the
-AMI privately with the target account, copy it so the target owns it, and encrypt
-the target copy.
+Create a live baseline EC2 AMI with `--no-reboot` after taking and copying an
+independent logical PostgreSQL backup off the instance. Share the AMI privately
+with the target account, copy it so the target owns it, and encrypt the target
+copy. The source Keycloak service remains available while this baseline is made.
 
 The AMI is useful for moving Ubuntu, Docker, scripts, systemd units, provider files,
 themes, and EBS-backed Docker data. It does not move the VPC, security groups, IAM
@@ -261,7 +262,12 @@ not automatically backfill content that existed before replication was configure
 
 ## 8. Step 3 — Migrate Keycloak EC2 and Its Database
 
-### Create the Target EC2 Instance
+### Prepare the Target Foundation, Then Create the EC2 Instance
+
+Before launching EC2, run `migrate-keycloak-ec2.sh --target-status`, followed by
+`--prepare-target --execute`. This creates or reuses the IAM/SSM instance profile,
+ALB and EC2 security groups, target group, new target ALB, and HTTPS listener. The
+script then prints the exact values required for the manual EC2 launch.
 
 Create the target instance using the target account's existing infrastructure:
 
@@ -271,7 +277,8 @@ Create the target instance using the target account's existing infrastructure:
 - Ubuntu 24.04 x86_64
 - Initial size `t3.medium`, matching the source
 - Encrypted EBS storage
-- IAM instance profile for Systems Manager and required secret access
+- IAM instance profile for Systems Manager; add separate least-privilege
+  application permissions only if they are proven necessary
 - IMDSv2 required, hop limit 2
 - No public database or administration ports
 
@@ -283,27 +290,37 @@ the rehearsal PostgreSQL dump and test the complete startup sequence.
 A clean Ubuntu rebuild from version-controlled scripts can follow after migration,
 but it is not required for the initial account move.
 
-### Restore the Containers
+### Restore PostgreSQL and Start Host Keycloak
 
-1. Pull the migrated Keycloak image from target ECR.
-2. Recreate the database container with persistent encrypted storage.
-3. Restore the logical database dump.
-4. Recreate the Keycloak container using the same tested version.
-5. Load secrets from the target account's approved secret store.
-6. Restore required provider JARs, themes, and keystores.
-7. Configure the external hostname as
+The verified deployment does not run Keycloak in Docker. The AMI contains the
+host Keycloak installation, deployment repository, provider JARs, certificates,
+keystores, Docker installation, and the EBS-backed PostgreSQL named volume.
+
+1. Launch the target-owned encrypted AMI in the existing target network.
+2. Confirm Docker can see `oid4vci-deployment_db_data`.
+3. Restore the rehearsal logical database dump into the PostgreSQL container.
+4. From `oid4vci-deployment`, run `./keycloak-ssi.sh setup -d`; this starts the
+   PostgreSQL `db` service and then starts host `bin/kc.sh` against
+   `localhost:5433`.
+5. Load secrets from the target account's approved secret store and remove
+   obsolete source credentials.
+6. Verify the copied provider JARs, themes, certificates, and keystores.
+7. Preserve the external hostname as
    `https://keycloak-demo.solutions.adorsys.com`.
-8. Start the containers and verify restart persistence.
+8. Boot-time automation is deferred by the workload owner for this migration.
+   Until it is added later, manually run `./keycloak-ssi.sh setup -d` after any
+   EC2 reboot or stop/start before expecting the ALB target to recover.
 
 ### Connect Keycloak to the Load Balancer
 
-Create a new dedicated target Keycloak ALB and listener; do not migrate or reuse
-the source `keycloak-demo-LB`:
+The earlier `--prepare-target --execute` step creates or reuses a new dedicated
+target Keycloak ALB and listener; it does not migrate or reuse the source
+`keycloak-demo-LB`:
 
 - HTTPS listener using the target ACM certificate
 - Host: `keycloak-demo.solutions.adorsys.com`
-- Target: the target Keycloak EC2 application port
-- Health check: a path that returns HTTP 200
+- Target: target EC2 port 80, where host Nginx proxies to Keycloak on 8443
+- Health check: `/realms/master`, which was verified to return HTTP 200
 
 The source health check is currently wrong: `/` redirects with HTTP 302, while the
 target group accepts only 200. In the target account either:
@@ -311,8 +328,10 @@ target group accepts only 200. In the target account either:
 - Use a proper Keycloak readiness endpoint, or
 - Temporarily accept `200-399` until a dedicated health endpoint is enabled
 
-Test Keycloak through a temporary hostname before changing the production DNS
-record.
+After restoring and starting the target, use
+`--register-target i-TARGET_INSTANCE_ID --execute`. The script registers the
+instance, waits for healthy status, and tests the new ALB using the production
+hostname for SNI/Host without changing the production DNS record.
 
 ## 9. Step 4 — Migrate the nginx ECS Service
 
@@ -606,13 +625,20 @@ steps do not change production traffic. The command-by-command procedure is in t
 
 ### Phase C — Prepare and Test the Stateful Host
 
-- Stop Keycloak and PostgreSQL cleanly for a controlled baseline AMI
+- Create and checksum an online PostgreSQL dump and copy it off the source EC2
+- Run `migrate-keycloak-ec2.sh --dry-run`
+- Create a live no-reboot baseline AMI without interrupting source Keycloak
 - Privately share the source AMI and its backing snapshots with the target account
 - Copy and encrypt the AMI so it is owned by the target account
-- Launch it in the existing target infrastructure
+- Run `migrate-keycloak-ec2.sh --target-status`, then
+  `--prepare-target --execute` to create/reuse the IAM profile, security groups,
+  target group, new ALB, and HTTPS listener
+- Manually launch the target EC2 using the exact settings printed by the script;
+  the key pair is optional when Systems Manager is used
 - Replace source-account credentials, ARNs, ECR URIs, and log destinations
 - Restore a rehearsal PostgreSQL backup
-- Test Keycloak through a temporary hostname
+- Test Keycloak through the target ALB with production SNI/Host using
+  `curl --connect-to`, without changing DNS
 - Verify restored realms, users, clients, keys, and database state
 - Test nginx with the wallet's real proxy requests
 - Test wallet root and deep links through target CloudFront
@@ -620,13 +646,23 @@ steps do not change production traffic. The command-by-command procedure is in t
 
 ### Phase D — Final Cutover
 
+Execution decision for this migration: the workload owner accepts the configuration
+copied through the AMI and the verified PostgreSQL restore on the target as the
+final migration state. The additional synchronization steps below are conditional:
+repeat the relevant configuration and/or database transfer only if the source
+configuration or database changes before DNS cutover.
+
 1. Run and verify the final wallet and metadata S3 sync.
 2. Change `proxy` DNS first because nginx is stateless.
 3. Validate the wallet's real proxy flows; roll back DNS if they fail.
-4. Announce Keycloak maintenance and stop source Keycloak writes.
-5. Keep source PostgreSQL running long enough to create the final logical backup.
-6. Checksum, transfer, restore, and verify the final database backup.
-7. Start and validate target Keycloak through its temporary hostname.
+4. Confirm that the source configuration and database have not changed since the
+   accepted AMI/configuration copy and PostgreSQL backup.
+5. If either changed, transfer the relevant configuration and/or announce
+   maintenance, stop source Keycloak writes, and create a final logical backup.
+6. If a database backup was required by step 5, checksum, transfer, restore, and
+   verify that final dump.
+7. Start and validate target Keycloak through the target ALB with production
+   SNI/Host using `curl --connect-to`, without changing DNS.
 8. Change `keycloak-demo` DNS.
 9. Validate login, discovery, redirects, signing material, and OID4VC endpoints.
 10. Keep source Keycloak stopped to prevent split-brain writes.
