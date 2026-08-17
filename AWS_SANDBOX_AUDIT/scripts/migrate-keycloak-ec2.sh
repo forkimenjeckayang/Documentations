@@ -11,11 +11,14 @@
 #   6. Create/reuse the target IAM profile, security groups, target group, ALB,
 #      and HTTPS listener without launching EC2 or changing DNS.
 #   7. Validate and register a manually launched target EC2 instance.
+#   8. After explicit approval, atomically cut production DNS over to the target
+#      ALB, or roll it back to the verified source ALB.
 #
 # It deliberately does NOT stop Keycloak, create/restore PostgreSQL dumps, launch
-# an EC2 instance, or change DNS. Database work and the manual EC2 launch require
-# separate validation. The source instance is never stopped, rebooted, terminated,
-# or otherwise modified by this script.
+# an EC2 instance, or change DNS during preparation/registration modes. Database
+# work and the manual EC2 launch require separate validation. DNS changes require
+# the explicit --cutover/--rollback mode plus --execute. The source instance is
+# never stopped, rebooted, terminated, or otherwise modified by this script.
 
 set -Eeuo pipefail
 
@@ -26,6 +29,9 @@ readonly TARGET_PROFILE="${TARGET_PROFILE:-default}"
 readonly SOURCE_REGION="${SOURCE_REGION:-eu-north-1}"
 readonly TARGET_REGION="${TARGET_REGION:-eu-central-1}"
 readonly SOURCE_INSTANCE_ID="${SOURCE_INSTANCE_ID:-i-03eac5cc262731ede}"
+readonly SOURCE_ALB_NAME="${SOURCE_ALB_NAME:-keycloak-demo-LB}"
+readonly SOURCE_ALB_DNS="${SOURCE_ALB_DNS:-keycloak-demo-LB-851915636.eu-north-1.elb.amazonaws.com}"
+readonly SOURCE_ALB_ZONE_ID="${SOURCE_ALB_ZONE_ID:-Z23TAZ6LKFMNIO}"
 readonly SOURCE_AMI_NAME="${SOURCE_AMI_NAME:-keycloak-demo-migration-baseline-20260814}"
 readonly TARGET_AMI_NAME="${TARGET_AMI_NAME:-keycloak-demo-migration-target-20260814}"
 readonly MIGRATION_TAG="${MIGRATION_TAG:-keycloak-demo-account-migration}"
@@ -41,8 +47,12 @@ readonly TARGET_ALB_NAME="${TARGET_ALB_NAME:-keycloak-demo-migration}"
 readonly TARGET_CERTIFICATE_ARN="${TARGET_CERTIFICATE_ARN:-arn:aws:acm:eu-central-1:982081049921:certificate/d556613f-db8a-44cb-b4f2-bf360443346a}"
 readonly TARGET_SSL_POLICY="${TARGET_SSL_POLICY:-ELBSecurityPolicy-TLS13-1-2-2021-06}"
 readonly TARGET_DOMAIN="${TARGET_DOMAIN:-keycloak-demo.solutions.adorsys.com}"
+readonly TARGET_RECORD_NAME="${TARGET_RECORD_NAME:-keycloak-demo.solutions.adorsys.com.}"
+readonly HOSTED_ZONE_ID="${HOSTED_ZONE_ID:-Z02911502N07V5SNAMLHL}"
+readonly HOSTED_ZONE_NAME="${HOSTED_ZONE_NAME:-solutions.adorsys.com.}"
 readonly TARGET_PORT="${TARGET_PORT:-80}"
 readonly TARGET_HEALTH_PATH="${TARGET_HEALTH_PATH:-/realms/master}"
+readonly TARGET_DISCOVERY_PATH="${TARGET_DISCOVERY_PATH:-/realms/master/.well-known/openid-configuration}"
 readonly IMAGE_WAIT_TIMEOUT_SECONDS="${IMAGE_WAIT_TIMEOUT_SECONDS:-14400}"
 readonly IMAGE_WAIT_INTERVAL_SECONDS="${IMAGE_WAIT_INTERVAL_SECONDS:-30}"
 readonly SSM_POLICY_ARN="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -82,6 +92,10 @@ Modes:
   --target-status   Read-only status of target foundation and optional EC2.
   --register-target <instance-id>
                     Validate/register the manually launched EC2 and test the ALB.
+  --cutover         Revalidate target health and Keycloak, then atomically UPSERT
+                    production DNS to the target ALB.
+  --rollback        Revalidate source Keycloak, then atomically UPSERT production
+                    DNS back to the source ALB.
   --revoke-share    Remove target-account access to source AMI and snapshots.
 
 Confirmation flags:
@@ -99,7 +113,11 @@ Recommended sequence:
   6. Manually launch EC2 using the exact settings printed by the script.
   7. Restore PostgreSQL and start Keycloak on the isolated target.
   8. Run: ./scripts/migrate-keycloak-ec2.sh --register-target i-... --execute
-  9. After the target copy is proven independent, optionally run:
+  9. After application approval, run:
+     ./scripts/migrate-keycloak-ec2.sh --cutover --execute
+ 10. If rollback is required, run:
+     ./scripts/migrate-keycloak-ec2.sh --rollback --execute
+ 11. After the target copy is proven independent, optionally run:
      ./scripts/migrate-keycloak-ec2.sh --revoke-share --execute
 
 The AMI names can be versioned through SOURCE_AMI_NAME and TARGET_AMI_NAME.
@@ -123,6 +141,8 @@ while (($# > 0)); do
       (($# > 0)) || die "--register-target requires an EC2 instance ID"
       TARGET_INSTANCE_ID="$1"
       ;;
+    --cutover) MODE="cutover" ;;
+    --rollback) MODE="rollback" ;;
     --revoke-share) MODE="revoke-share" ;;
     --execute) EXECUTE="true" ;;
     --backup-confirmed) BACKUP_CONFIRMED="true" ;;
@@ -819,6 +839,225 @@ register_and_test_target() {
 }
 
 
+verify_authoritative_zone() {
+  local zone zone_name
+  local -a route53_ns=() public_ns=()
+
+  require_command dig
+  require_command sed
+  require_command sort
+
+  zone="$(aws route53 get-hosted-zone --profile "$SOURCE_PROFILE" --id "$HOSTED_ZONE_ID")"
+  zone_name="$(jq -r '.HostedZone.Name' <<<"$zone")"
+  [[ "$zone_name" == "$HOSTED_ZONE_NAME" ]] ||
+    die "Hosted zone $HOSTED_ZONE_ID has unexpected name '$zone_name'"
+  [[ "$(jq -r '.HostedZone.Config.PrivateZone' <<<"$zone")" == "false" ]] ||
+    die "Hosted zone $HOSTED_ZONE_ID is private"
+
+  mapfile -t route53_ns < <(jq -r '.DelegationSet.NameServers[]' <<<"$zone" | sort)
+  mapfile -t public_ns < <(dig +short NS "${HOSTED_ZONE_NAME%.}" | sed 's/\.$//' | sort)
+  [[ "$(printf '%s\n' "${route53_ns[@]}")" == "$(printf '%s\n' "${public_ns[@]}")" ]] ||
+    die "Hosted zone $HOSTED_ZONE_ID is not publicly authoritative"
+
+  log "Verified authoritative Route 53 zone $HOSTED_ZONE_ID"
+}
+
+verify_source_alb() {
+  local alb actual_dns actual_zone
+
+  alb="$(aws elbv2 describe-load-balancers --profile "$SOURCE_PROFILE" \
+    --region "$SOURCE_REGION" --names "$SOURCE_ALB_NAME")"
+  actual_dns="$(jq -r '.LoadBalancers[0].DNSName' <<<"$alb")"
+  actual_zone="$(jq -r '.LoadBalancers[0].CanonicalHostedZoneId' <<<"$alb")"
+
+  [[ "${actual_dns,,}" == "${SOURCE_ALB_DNS,,}" ]] ||
+    die "Source ALB DNS changed from the verified value: $actual_dns"
+  [[ "$actual_zone" == "$SOURCE_ALB_ZONE_ID" ]] ||
+    die "Source ALB hosted-zone ID changed from the verified value: $actual_zone"
+  jq -e '.LoadBalancers[0] |
+    .State.Code == "active" and .Scheme == "internet-facing" and .Type == "application"
+  ' <<<"$alb" >/dev/null || die "Source Keycloak ALB is not an active internet-facing ALB"
+
+  log "Verified source ALB $actual_dns"
+}
+
+test_keycloak_through_alb() {
+  local alb_dns="$1"
+  local label="$2"
+  local discovery issuer expected_issuer
+
+  require_command curl
+  discovery="$(curl --fail --silent --show-error --max-time 30 --noproxy '*' \
+    --connect-to "$TARGET_DOMAIN:443:$alb_dns:443" \
+    "https://$TARGET_DOMAIN$TARGET_DISCOVERY_PATH")" ||
+    die "$label Keycloak discovery request through $alb_dns failed"
+
+  issuer="$(jq -r '.issuer // empty' <<<"$discovery")"
+  expected_issuer="https://$TARGET_DOMAIN/realms/master"
+  [[ "$issuer" == "$expected_issuer" ]] ||
+    die "$label Keycloak returned issuer '$issuer'; expected '$expected_issuer'"
+
+  log "Verified $label Keycloak HTTPS and OIDC discovery through $alb_dns"
+}
+
+verify_target_ready_for_dns() {
+  local alb health healthy total
+
+  discover_target_foundation
+  [[ -n "$TARGET_GROUP_ARN" && -n "$TARGET_ALB_ARN" &&
+     -n "$TARGET_ALB_DNS" && -n "$TARGET_ALB_ZONE_ID" &&
+     -n "$TARGET_LISTENER_ARN" ]] ||
+    die "Target foundation is incomplete; run --prepare-target and --register-target first"
+
+  alb="$(aws elbv2 describe-load-balancers --profile "$TARGET_PROFILE" \
+    --region "$TARGET_REGION" --load-balancer-arns "$TARGET_ALB_ARN")"
+  jq -e --arg dns "$TARGET_ALB_DNS" --arg zone "$TARGET_ALB_ZONE_ID" '
+    .LoadBalancers[0] |
+    .State.Code == "active" and .Scheme == "internet-facing" and
+    .Type == "application" and .DNSName == $dns and
+    .CanonicalHostedZoneId == $zone
+  ' <<<"$alb" >/dev/null || die "Target ALB is not active or no longer matches its discovered identity"
+
+  health="$(aws elbv2 describe-target-health --profile "$TARGET_PROFILE" \
+    --region "$TARGET_REGION" --target-group-arn "$TARGET_GROUP_ARN")"
+  total="$(jq '.TargetHealthDescriptions | length' <<<"$health")"
+  healthy="$(jq '[.TargetHealthDescriptions[] |
+    select(.TargetHealth.State == "healthy")] | length' <<<"$health")"
+  ((total > 0 && healthy == total)) ||
+    die "Target group is not fully healthy: $healthy/$total healthy"
+
+  test_keycloak_through_alb "$TARGET_ALB_DNS" "target"
+  log "Verified target readiness for DNS cutover: $healthy/$total healthy"
+}
+
+current_dns_record() {
+  aws route53 list-resource-record-sets --profile "$SOURCE_PROFILE" \
+    --hosted-zone-id "$HOSTED_ZONE_ID" \
+    --start-record-name "$TARGET_RECORD_NAME" --start-record-type A --max-items 1 \
+    --query "ResourceRecordSets[?Name=='$TARGET_RECORD_NAME' && Type=='A'] | [0]" \
+    --output json
+}
+
+normalized_record_dns() {
+  jq -r '.AliasTarget.DNSName // empty' |
+    sed 's/^dualstack\.//;s/\.$//' |
+    tr '[:upper:]' '[:lower:]'
+}
+
+save_dns_record() {
+  local record="$1"
+  local action="$2"
+  local backup="$LOG_DIR/keycloak-dns-before-$action-$(date -u +%Y%m%dT%H%M%SZ).json"
+
+  printf '%s\n' "$record" >"$backup"
+  chmod 600 "$backup"
+  log "Saved pre-$action DNS record to $backup"
+}
+
+upsert_dns_alias() {
+  local dns_name="$1"
+  local zone_id="$2"
+  local description="$3"
+  local change_batch change_id record actual_dns actual_zone
+
+  change_batch="$(jq -n \
+    --arg name "$TARGET_RECORD_NAME" \
+    --arg dns "dualstack.$dns_name." \
+    --arg zone "$zone_id" \
+    --arg comment "$description" '{
+      Comment: $comment,
+      Changes: [{
+        Action: "UPSERT",
+        ResourceRecordSet: {
+          Name: $name,
+          Type: "A",
+          AliasTarget: {
+            HostedZoneId: $zone,
+            DNSName: $dns,
+            EvaluateTargetHealth: true
+          }
+        }
+      }]
+    }')"
+
+  change_id="$(aws route53 change-resource-record-sets \
+    --profile "$SOURCE_PROFILE" --hosted-zone-id "$HOSTED_ZONE_ID" \
+    --change-batch "$change_batch" --query ChangeInfo.Id --output text)"
+  aws route53 wait resource-record-sets-changed \
+    --profile "$SOURCE_PROFILE" --id "$change_id"
+
+  record="$(current_dns_record)"
+  actual_dns="$(normalized_record_dns <<<"$record")"
+  actual_zone="$(jq -r '.AliasTarget.HostedZoneId // empty' <<<"$record")"
+  [[ "$actual_dns" == "${dns_name,,}" && "$actual_zone" == "$zone_id" ]] ||
+    die "Route 53 is INSYNC but the resulting alias does not match the requested ALB"
+
+  log "Route 53 change is INSYNC: $description"
+}
+
+cutover_dns() {
+  local record current_dns current_zone
+
+  verify_authoritative_zone
+  verify_source_alb
+  verify_target_ready_for_dns
+
+  record="$(current_dns_record)"
+  [[ "$record" != "null" ]] || die "Production A alias $TARGET_RECORD_NAME does not exist"
+  current_dns="$(normalized_record_dns <<<"$record")"
+  current_zone="$(jq -r '.AliasTarget.HostedZoneId // empty' <<<"$record")"
+
+  if [[ "$current_dns" == "${TARGET_ALB_DNS,,}" ]]; then
+    [[ "$current_zone" == "$TARGET_ALB_ZONE_ID" ]] ||
+      die "DNS uses the target ALB name with an unexpected hosted-zone ID"
+    log "Production DNS already points to the target ALB; no DNS change required"
+  else
+    [[ "$current_dns" == "${SOURCE_ALB_DNS,,}" &&
+       "$current_zone" == "$SOURCE_ALB_ZONE_ID" ]] ||
+      die "Production DNS points to unexpected alias '$current_dns' in zone '$current_zone'"
+    save_dns_record "$record" "cutover"
+    upsert_dns_alias "$TARGET_ALB_DNS" "$TARGET_ALB_ZONE_ID" \
+      "Migrate $TARGET_DOMAIN to target Keycloak ALB"
+  fi
+
+  test_keycloak_through_alb "$TARGET_ALB_DNS" "target"
+  log "CUTOVER RESULT: PASS - $TARGET_DOMAIN aliases the target ALB"
+  log "Keep the source Keycloak stack unchanged during the rollback monitoring period"
+}
+
+rollback_dns() {
+  local record current_dns current_zone
+
+  verify_authoritative_zone
+  verify_source_alb
+  test_keycloak_through_alb "$SOURCE_ALB_DNS" "source"
+
+  discover_target_foundation
+  [[ -n "$TARGET_ALB_DNS" && -n "$TARGET_ALB_ZONE_ID" ]] ||
+    die "Target ALB could not be discovered"
+
+  record="$(current_dns_record)"
+  [[ "$record" != "null" ]] || die "Production A alias $TARGET_RECORD_NAME does not exist"
+  current_dns="$(normalized_record_dns <<<"$record")"
+  current_zone="$(jq -r '.AliasTarget.HostedZoneId // empty' <<<"$record")"
+
+  if [[ "$current_dns" == "${SOURCE_ALB_DNS,,}" ]]; then
+    [[ "$current_zone" == "$SOURCE_ALB_ZONE_ID" ]] ||
+      die "DNS uses the source ALB name with an unexpected hosted-zone ID"
+    log "Production DNS already points to the source ALB; no DNS change required"
+  else
+    [[ "$current_dns" == "${TARGET_ALB_DNS,,}" &&
+       "$current_zone" == "$TARGET_ALB_ZONE_ID" ]] ||
+      die "Production DNS points to unexpected alias '$current_dns' in zone '$current_zone'"
+    save_dns_record "$record" "rollback"
+    upsert_dns_alias "$SOURCE_ALB_DNS" "$SOURCE_ALB_ZONE_ID" \
+      "Rollback $TARGET_DOMAIN to sandbox Keycloak ALB"
+  fi
+
+  test_keycloak_through_alb "$SOURCE_ALB_DNS" "source"
+  log "ROLLBACK RESULT: PASS - $TARGET_DOMAIN aliases the source ALB"
+}
+
 revoke_source_sharing() {
   local snapshot_id
   local -a snapshots=()
@@ -880,6 +1119,14 @@ main() {
     register-target)
       [[ "$EXECUTE" == "true" ]] || die "--register-target requires --execute"
       register_and_test_target
+      ;;
+    cutover)
+      [[ "$EXECUTE" == "true" ]] || die "--cutover requires --execute"
+      cutover_dns
+      ;;
+    rollback)
+      [[ "$EXECUTE" == "true" ]] || die "--rollback requires --execute"
+      rollback_dns
       ;;
     revoke-share)
       [[ "$EXECUTE" == "true" ]] || die "--revoke-share requires --execute"

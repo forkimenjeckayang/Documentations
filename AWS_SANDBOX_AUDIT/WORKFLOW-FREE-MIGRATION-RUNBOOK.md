@@ -5,8 +5,8 @@
 - **Source Region:** `eu-north-1`
 - **Target Region:** `eu-central-1`, except CloudFront certificates in `us-east-1`
 - **Purpose:** Migrate the remaining sandbox workloads without running repository workflows
-- **Status:** Wallet and nginx are migrated; the target Keycloak stack and
-  owner-accepted database state are healthy before cutover; Keycloak DNS remains
+- **Status:** Wallet, nginx, and Keycloak are migrated; production Keycloak DNS
+  points to the target ALB and all three workloads are under monitoring
 
 ## 1. Short Answer
 
@@ -416,7 +416,33 @@ The public Keycloak hostname remains
 `https://keycloak-demo.solutions.adorsys.com`; only its DNS target changes during
 the later explicit cutover.
 
-#### Current Target Checkpoint - 2026-08-14
+After application acceptance, run:
+
+```bash
+./scripts/migrate-keycloak-ec2.sh --cutover --execute
+```
+
+This explicit mode verifies that the sandbox Route 53 zone is still publicly
+authoritative, checks the known source ALB identity, requires every registered
+target to be healthy, and validates target HTTPS/OIDC discovery with the production
+SNI and Host. It changes DNS only when the current alias is the verified source ALB.
+The previous record is saved with mode `0600` under `.migration-logs/`, and one
+Route 53 `UPSERT` changes the alias without deleting it first. It waits for
+`INSYNC` and verifies the resulting alias. If DNS already points to the target,
+the rerun logs that no change is required and repeats target validation.
+
+If an approved rollback is required and the stateful rollback rules have been
+satisfied, run:
+
+```bash
+./scripts/migrate-keycloak-ec2.sh --rollback --execute
+```
+
+Rollback first validates source HTTPS/OIDC and only accepts the known target or
+source alias state. It is also idempotent. An unexpected DNS destination causes
+either mode to stop without overwriting the record.
+
+#### Current Target and Production Cutover Checkpoint - 2026-08-17
 
 - Target-owned encrypted AMI: `ami-086507936442bb043`
 - Target IAM role and instance profile: `keycloak-demo-ec2-role`
@@ -432,14 +458,23 @@ the later explicit cutover.
 - Rehearsal backup checksums: verified `OK` before restore
 - PostgreSQL: rehearsal database restored from the logical custom-format dump
 - Host Keycloak: running on 8443; direct HTTPS and Nginx port 80 both return 200
-- Target ALB: production SNI/Host HTTPS test and OIDC discovery verified while
-  production DNS still points to the source
+- Target ALB: production SNI/Host HTTPS test and OIDC discovery verified
+- Production DNS: `keycloak-demo.solutions.adorsys.com` aliases target ALB
+  `keycloak-demo-migration-1394321177.eu-central-1.elb.amazonaws.com` in canonical
+  hosted zone `Z215JYRZR1TBD5`
+- Route 53 cutover: `INSYNC`; public discovery returns issuer
+  `https://keycloak-demo.solutions.adorsys.com/realms/master`
+- Cutover log: `.migration-logs/keycloak-ec2-cutover-20260817T105412Z-2403011.log`
+- Saved pre-cutover record:
+  `.migration-logs/keycloak-dns-before-cutover-20260817T105434Z.json`
 
 The workload owner accepts the configuration copied through the AMI and the
 verified PostgreSQL restore on the target as the final migration state. This does
-not mean that the source database is unused. No additional transfer is required as
-long as the source configuration and database remain unchanged before DNS cutover.
-If either changes, repeat the relevant configuration and/or database transfer.
+not mean that the source database is unused. No additional transfer was required because the accepted source configuration
+and database did not change before DNS cutover. From cutover onward, the target is
+the authoritative production state. Keep the source unchanged during monitoring;
+any rollback after target-side writes requires the documented data-reconciliation
+decision.
 
 Boot-time automation is intentionally deferred by the workload owner. This is an
 accepted operational risk for the current migration, not a DNS-cutover blocker.
@@ -1234,6 +1269,98 @@ Before deleting the sandbox hosted zone, copy all active records—including ACM
 validation CNAMEs—to the target zone, change the parent delegation, verify public
 DNS, and keep the source zone through the rollback period.
 
+### Prepare the Target Hosted Zone for Authority
+
+Live verification on 2026-08-17 established the following state:
+
+| Item | Sandbox/source | Target |
+|---|---|---|
+| Account | `917848404243` | `982081049921` |
+| Zone ID | `Z02911502N07V5SNAMLHL` | `Z05071841EFF9JQA59TZL` |
+| Record count before preparation | 11 | 3 |
+| Public authority | Yes | No |
+| DNSSEC | `NOT_SIGNING` | `NOT_SIGNING` |
+
+The target zone initially contains only its own NS/SOA records and the target ACM
+validation CNAME. The source zone has nine non-NS/non-SOA records. The target
+already has one of those nine, so the first execution should plan eight UPSERTs.
+
+Execution and verification completed on 2026-08-17. Target zone
+`Z05071841EFF9JQA59TZL` now contains 11 records. The strict `--verify` run
+reported no required changes, full non-NS/non-SOA parity, and successful direct
+target-name-server answers for wallet, proxy, and Keycloak. Its ignored
+verification log is:
+
+```text
+.migration-logs/route53-zone-verify-20260817T141434Z-2575661.log
+```
+
+The record-copy step is complete. Rerun `--verify` before delegation if any DNS
+record changes in the meantime.
+
+Record classification:
+
+| Records | Why copy now? | Later lifecycle |
+|---|---|---|
+| `wallet`, `proxy`, and `keycloak-demo` A aliases | Required production routing; each already points to the verified target resource | Keep in target |
+| `_6878...` ACM CNAME | Validates both target wildcard certificates and is required for managed renewal | Keep in target |
+| `_f6b...` ACM CNAME | Validates both source wildcard certificates | Keep through source rollback/certificate retirement, then optionally remove from target |
+| `_wallet...` TXT | CloudFront cross-account ownership proof/audit evidence | Retain through CloudFront rollback, then review |
+| apex TXT `hzcqp17swv` | Purpose is not established; preserve rather than break an unknown consumer | Remove only after its owner confirms it is unused |
+| `wallet-migration` and `proxy-migration` CNAMEs | Preserve tested migration endpoints during propagation and rollback | Remove from target after monitoring if no longer used |
+
+Do not copy either zone's NS or SOA records. Route 53 assigns these records and a
+unique set of four name servers to each hosted zone.
+
+Run the read-only plan:
+
+```bash
+./scripts/prepare-route53-zone-migration.sh --dry-run
+```
+
+Review the ignored log and planned UPSERT list. When approved, prepare only the
+target zone:
+
+```bash
+./scripts/prepare-route53-zone-migration.sh --execute
+```
+
+Rerun strict, read-only verification at any time:
+
+```bash
+./scripts/prepare-route53-zone-migration.sh --verify
+```
+
+All modes verify both account IDs, both public zone IDs, and current public
+authority. No arguments also selects the safe dry run. `--execute` is idempotent:
+matching records cause no write; missing or different records are UPSERTed. It
+refuses to execute after authority has already moved and never changes or deletes
+a source record or the parent delegation.
+
+After execution, both zones contain equivalent application records, but public
+resolvers continue using the sandbox copies because the parent still delegates to
+the sandbox name servers. When the parent `adorsys.com` owner later replaces the
+four delegated sandbox name servers with the target zone's four name servers,
+new resolvers use the target copies. Resolvers with the old delegation cached may
+continue querying the sandbox for up to the old TTL, which is why both copies must
+remain unchanged and available during propagation.
+
+After the delegation change and monitoring:
+
+- the target copies become the live authoritative records and must remain;
+- the sandbox copies become inactive rollback copies;
+- delete temporary test records from the target only after confirming they are
+  unused;
+- delete the `_f6b...` source-certificate validation record only after the source
+  certificates and rollback requirement are gone;
+- delete the entire sandbox hosted zone only after the old delegation TTL,
+  monitoring window, certificate rollback, and explicit approval are complete.
+
+The parent delegation currently has TTL `86400`. Ask its owner to lower that TTL,
+wait a full old-TTL period, and only then replace the name-server values. The
+preparation script intentionally cannot perform that separate cross-account
+authority cutover.
+
 ### Keycloak Load-Balancer Route
 
 Create a new dedicated target Keycloak ALB; do not migrate or reuse the source
@@ -1300,7 +1427,10 @@ separate, optional project after the workloads are stable.
    the relevant configuration transfer and/or stop source writes and create,
    checksum, transfer, restore, and verify a new final PostgreSQL dump.
 4. Revalidate target Keycloak and the healthy ALB target.
-5. Change Keycloak DNS and validate login, discovery, redirects, and OID4VC endpoints.
+5. Completed 2026-08-17: ran
+   `./scripts/migrate-keycloak-ec2.sh --cutover --execute`; Route 53 reached
+   `INSYNC`, and production HTTPS/OIDC validation passed. Continue application
+   login, redirect, and OID4VC monitoring.
 6. Completed: the wallet CloudFront alias and DNS were moved to the target.
 7. Confirm and validate any remaining metadata consumer URL updates.
 8. Retain the source Keycloak stack during monitoring for rollback, while avoiding
@@ -1329,7 +1459,8 @@ No application database reconciliation is needed.
 1. Stop target Keycloak so it cannot accept more writes.
 2. Decide whether target writes must be exported and reconciled.
 3. Start source PostgreSQL and source Keycloak.
-4. Restore Keycloak DNS to the source ALB.
+4. Run `./scripts/migrate-keycloak-ec2.sh --rollback --execute` to restore
+   Keycloak DNS to the verified source ALB.
 5. Validate the source issuer and wallet login.
 
 If the target has accepted writes, rollback is a data-reconciliation event, not only

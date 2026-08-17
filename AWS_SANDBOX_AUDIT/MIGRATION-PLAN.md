@@ -333,6 +333,21 @@ After restoring and starting the target, use
 instance, waits for healthy status, and tests the new ALB using the production
 hostname for SNI/Host without changing the production DNS record.
 
+After application acceptance, run `--cutover --execute`. This separate mode
+revalidates the authoritative hosted zone, source and target ALB identities, target
+health, HTTPS, and OIDC issuer; accepts only the known source or target DNS state;
+saves the current record under the Git-ignored log directory; and performs one
+atomic Route 53 `UPSERT`. A rerun is a no-op when DNS already targets the new ALB.
+Use `--rollback --execute` to perform the same guarded process back to the verified
+source ALB, subject to the stateful rollback rules in section 15.
+
+Production cutover completed successfully on 2026-08-17. Route 53 now aliases
+`keycloak-demo.solutions.adorsys.com` to target ALB
+`keycloak-demo-migration-1394321177.eu-central-1.elb.amazonaws.com` using canonical
+hosted-zone ID `Z215JYRZR1TBD5`. The change reached `INSYNC`; public OIDC discovery
+returns the expected production issuer, and target EC2 `i-006ca4ea5780923de` is
+healthy. Retain the source unchanged during monitoring for controlled rollback.
+
 ## 9. Step 4 — Migrate the nginx ECS Service
 
 The source service is stateless, so it can run in both accounts during testing.
@@ -577,21 +592,55 @@ an apex domain, use AWS's supported cross-account wildcard procedure:
 6. Retain the source for rollback; remove temporary records and the wildcard only
    after the agreed stability period.
 
-### Optional Route 53 Zone Migration
+### Route 53 Hosted-Zone Authority Migration
 
-Moving the `solutions.adorsys.com` hosted zone is optional and should happen only
-after all application resources are stable in the target account.
+The stable application resources now run in the target account, so move DNS
+authority before source-resource retirement. This is a hosted-zone migration, not
+a domain-registration transfer, and Route 53 public hosted zones are global rather
+than regional.
 
-If the team later wants DNS ownership in the target account:
+Live verification before target-zone preparation on 2026-08-17 found:
 
-1. Create the same hosted zone in the target account.
-2. Copy all non-NS/non-SOA records.
-3. Compare old and new DNS answers.
-4. Ask the owner of the parent `adorsys.com` DNS zone to change the delegated name
-   servers for `solutions.adorsys.com`.
-5. Keep the source zone until the rollback period is over.
+- authoritative sandbox zone `Z02911502N07V5SNAMLHL` with 11 records;
+- non-authoritative target zone `Z05071841EFF9JQA59TZL` with three records;
+- parent `adorsys.com` delegation still points to the four sandbox-zone name
+  servers with TTL `86400` (24 hours);
+- neither migration account owns the parent `adorsys.com` zone;
+- DNSSEC is not signing either child zone.
 
-This is a hosted-zone migration, not a domain-registration transfer.
+Target-zone preparation is now complete. A post-copy `--verify` found no required
+changes, confirmed full non-NS/non-SOA parity, verified the three production
+aliases through a target name server, and AWS reported 11 records in each child
+zone. Public authority remains on the sandbox zone. The remaining DNS work starts
+with the parent-zone owner lowering the current 24-hour delegation TTL; no
+additional record copy is required unless a DNS record changes before delegation.
+
+Run `scripts/prepare-route53-zone-migration.sh --dry-run` first. After review,
+`--execute` UPSERTs every non-NS/non-SOA source record into the target zone, waits
+for `INSYNC`, verifies parity, and queries a target name server directly. It never
+changes the parent delegation, source records, NS/SOA records, or deletes
+anything. It also refuses to copy if the three production source aliases no
+longer point to the verified target CloudFront and ALBs. Calling the script with
+no arguments is also a dry run for safety.
+
+Copy all active records for parity, including production aliases, both target and
+source ACM validation CNAMEs, ownership TXT records, and the temporary migration
+hostnames. Temporary and source-certificate records can be cleaned up later;
+copying them initially keeps both zones equivalent while resolvers may cache
+either delegation.
+
+After `--verify` passes:
+
+1. Ask the parent `adorsys.com` DNS owner to lower the
+   `solutions.adorsys.com` NS delegation TTL.
+2. Wait at least the previous 24-hour TTL.
+3. Replace the four sandbox name servers in the parent delegation with the four
+   target-zone name servers.
+4. Keep both zones unchanged and equivalent during propagation and rollback.
+5. Verify public NS/SOA, application HTTPS/OIDC, and target ACM status.
+6. Delete the source hosted zone only after the rollback period and source
+   certificates/resources have been retired. The target zone and its production
+   and target-ACM records remain.
 
 ## 13. Recommended Migration Order
 
@@ -663,7 +712,8 @@ configuration or database changes before DNS cutover.
    verify that final dump.
 7. Start and validate target Keycloak through the target ALB with production
    SNI/Host using `curl --connect-to`, without changing DNS.
-8. Change `keycloak-demo` DNS.
+8. Completed 2026-08-17: changed `keycloak-demo` DNS with the guarded script;
+   Route 53 reached `INSYNC` and now aliases the target ALB.
 9. Validate login, discovery, redirects, signing material, and OID4VC endpoints.
 10. Keep source Keycloak stopped to prevent split-brain writes.
 11. Move the CloudFront alias and change `wallet` DNS last.

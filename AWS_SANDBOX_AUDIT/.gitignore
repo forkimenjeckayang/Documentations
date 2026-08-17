@@ -12,6 +12,9 @@ repo-detection-output*.txt
 # Local migration dry-run and execution logs
 .migration-logs/
 
+# Local copy-ready GitHub issue drafts
+POST-MIGRATION-GITHUB-ISSUES.md
+
 # Local credentials and environment overrides
 .env
 .env.*

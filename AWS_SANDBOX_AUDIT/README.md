@@ -6,7 +6,8 @@
 **Target workload Region:** `eu-central-1`  
 **Last live source audit:** 2026-08-14 using read-only AWS CLI calls
 
-**Last live migration verification:** 2026-08-14 after Keycloak target registration and HTTPS/OIDC verification
+**Last live migration verification:** 2026-08-17 after Keycloak production DNS
+cutover, public HTTPS/OIDC verification, and target Route 53 record-parity checks
 
 This repository documents the remaining legacy-sandbox resources and their
 migration to the target AWS account. It does not create a new VPC; target resources
@@ -30,6 +31,10 @@ For an approachable explanation of the ECS/Fargate architecture used by the
 nginx migration, see the separate
 [Understanding Amazon ECS on Fargate: components, workflow, and HTTPS setup](../ECS-FARGATE-HTTPS-GUIDE.md)
 guide. It is background material, not a fourth authoritative migration document.
+
+Copy-ready repository follow-up work is collected in
+[Post-migration GitHub issue drafts](POST-MIGRATION-GITHUB-ISSUES.md). It is an
+operational planning artifact, not an additional authoritative runbook.
 
 ## Current Legacy-Sandbox State
 
@@ -101,7 +106,8 @@ Interpretation:
 | [`scripts/prepare-target-certificates.sh`](scripts/prepare-target-certificates.sh) | Reuse or request target ALB and CloudFront certificates and ensure authoritative validation CNAMEs |
 | [`scripts/create-wallet-cloudfront.sh`](scripts/create-wallet-cloudfront.sh) | Idempotently prepare the wallet OAC, wildcard-enabled target distribution, and cross-account ownership TXT without moving production traffic |
 | [`scripts/migrate-nginx-proxy.sh`](scripts/migrate-nginx-proxy.sh) | Idempotently copy the nginx image, create/reuse target ECS and a new ALB, test without DNS changes, then perform an explicit cutover or rollback |
-| [`scripts/migrate-keycloak-ec2.sh`](scripts/migrate-keycloak-ec2.sh) | Prepare/copy the Keycloak AMI; create/reuse the target IAM profile, security groups, target group, new ALB, and HTTPS listener; then validate/register the manually launched EC2 without changing DNS |
+| [`scripts/migrate-keycloak-ec2.sh`](scripts/migrate-keycloak-ec2.sh) | Prepare/copy the Keycloak AMI; create/reuse the target foundation; validate/register the manually launched EC2 without changing DNS; then perform an explicit, guarded, idempotent cutover or rollback |
+| [`scripts/prepare-route53-zone-migration.sh`](scripts/prepare-route53-zone-migration.sh) | Explicit `--dry-run`, target-only idempotent `--execute`, and direct-name-server `--verify` for hosted-zone authority migration; never changes the parent delegation or source zone |
 
 Use each script's read-only inspection before a mutating mode. For Keycloak, run
 `--dry-run` before `--prepare-ami`, and `--target-status` before
@@ -127,8 +133,10 @@ they may contain task-definition environment data or sensitive AWS metadata.
 8. The workload owner accepts the configuration copied through the AMI and the
    restored PostgreSQL backup on the target as the final migration state. If the
    source configuration or database changes before cutover, repeat the relevant
-   configuration and/or database transfer; otherwise revalidate the target and
-   cut over DNS.
+   configuration and/or database transfer.
+9. After application approval, run `--cutover --execute`. The script revalidates
+   the target and OIDC discovery, saves the current alias, and atomically changes
+   DNS. Use `--rollback --execute` only under the documented rollback rules.
 
 ## Migration Progress
 
@@ -138,15 +146,15 @@ they may contain task-definition environment data or sensitive AWS metadata.
 | Metadata S3 data/policy | Migrated; consumer URL updates still require confirmation |
 | Target ACM certificates | Issued in `eu-central-1` and `us-east-1` |
 | nginx ECS/ECR/new ALB | Migrated; production DNS points to target ALB and workload is under monitoring |
-| Keycloak EC2/PostgreSQL/new ALB | Target EC2 is running through SSM, the restored PostgreSQL backup is accepted by the workload owner as the final state, and Keycloak/OIDC are healthy behind the new HTTPS ALB; production DNS cutover remains |
-| Route 53 hosted zone | Remains authoritative in sandbox until workloads are stable |
+| Keycloak EC2/PostgreSQL/new ALB | Migrated; production DNS points to the target ALB, target EC2 and OIDC are healthy, and the workload is under monitoring |
+| Route 53 hosted zone | Target record copy and direct-name-server verification complete; sandbox remains authoritative until the parent delegation changes |
 
 ## Current Migration Notes
 
 - Target S3 buckets are `wallet-react-app-main` and
   `wallet-app-metadata-main` in `eu-central-1`.
-- The wallet target bucket remains private and will receive an OAC-scoped policy
-  after the target CloudFront distribution ID is known.
+- The wallet target bucket remains private and has an OAC-scoped policy for the
+  target CloudFront distribution.
 - The metadata target bucket uses its separate `PublicReadGetObject` policy and
   does not use CloudFront.
 - The target `eu-central-1` and `us-east-1` wildcard certificates are both
@@ -155,6 +163,12 @@ they may contain task-definition environment data or sensitive AWS metadata.
 - The shared validation CNAME was added to the publicly authoritative sandbox
   Route 53 zone. It validated the `eu-central-1` ALB certificate and the separate
   `us-east-1` certificate required by CloudFront.
+- Hosted-zone preparation completed on 2026-08-17. Target zone
+  `Z05071841EFF9JQA59TZL` now has 11 records and full non-NS/non-SOA parity with
+  sandbox zone `Z02911502N07V5SNAMLHL`. Direct queries to the target name servers
+  returned answers for wallet, proxy, and Keycloak. Public authority remains on
+  the sandbox zone; the parent DNS owner must lower the current 24-hour delegation
+  TTL, wait for it to expire, and then delegate to the target name servers.
 - Target CloudFront distribution `E1Z7SXTDZF3Z54` is deployed with OAC
   `ER4JW7O110RQV`, wildcard alias `*.solutions.adorsys.com`, exact alias
   `wallet.solutions.adorsys.com`, and a publicly resolving ownership TXT.
@@ -172,5 +186,10 @@ they may contain task-definition environment data or sensitive AWS metadata.
   PostgreSQL volume is `oid4vci-deployment_db_data`. PostgreSQL runs in Docker;
   Keycloak runs on the EC2 host through `./keycloak-ssi.sh setup -d` and connects
   to the published database port `localhost:5433`.
+- Keycloak production cutover completed on 2026-08-17. Route 53 now aliases
+  `keycloak-demo.solutions.adorsys.com` to
+  `keycloak-demo-migration-1394321177.eu-central-1.elb.amazonaws.com` in the target
+  account. The change reached `INSYNC`; public OIDC discovery returns the expected
+  production issuer, and target EC2 `i-006ca4ea5780923de` remains healthy.
 
 Follow the runbook’s validation gates before deleting any source resource.
