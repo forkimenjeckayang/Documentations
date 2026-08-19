@@ -32,6 +32,11 @@ nginx migration, see the separate
 [Understanding Amazon ECS on Fargate: components, workflow, and HTTPS setup](../ECS-FARGATE-HTTPS-GUIDE.md)
 guide. It is background material, not a fourth authoritative migration document.
 
+For a plain-language explanation of the parent/child DNS hierarchy, the
+current sandbox delegation, and how to verify the later authority cutover, see
+[DNS Authority and Delegation for `solutions.adorsys.com`](DNS-AUTHORITY-AND-DELEGATION.md).
+It is background material, not an additional authoritative migration document.
+
 Copy-ready repository follow-up work is collected in
 [Post-migration GitHub issue drafts](POST-MIGRATION-GITHUB-ISSUES.md). It is an
 operational planning artifact, not an additional authoritative runbook.
