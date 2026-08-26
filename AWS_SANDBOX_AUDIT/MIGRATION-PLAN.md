@@ -5,7 +5,7 @@
 - **Source Region:** `eu-north-1`
 - **Target Region:** `eu-central-1`
 - **Plan date:** 2026-08-11
-- **Status:** Plan only; no AWS resources have been changed
+- **Status:** Completed and source runtime retired; final live verification 2026-08-26
 
 ## 1. What This Plan Does
 
@@ -28,7 +28,17 @@ The migration preserves these public URLs:
 - `https://proxy.solutions.adorsys.com`
 - `https://wallet.solutions.adorsys.com`
 
-## 2. What Must Be Migrated
+### Completion record — 2026-08-26
+
+All three public URLs now serve target-account resources. The target Route 53 zone
+is authoritative, and the sandbox `solutions.adorsys.com` zone plus the
+migration-scoped EC2, ECS, ALBs, wallet buckets, wallet CloudFront distribution,
+ACM certificate, RDS instance, secret, and nginx ECR repository are removed.
+
+The remainder of this document preserves the design and execution history. Source
+rollback steps are historical because the source runtime no longer exists.
+
+## 2. Original Migration Scope
 
 | Component | Current source | What is needed in the target account |
 |---|---|---|
@@ -87,7 +97,7 @@ configurations, so create new dedicated target ALBs.
 
 ```mermaid
 flowchart TD
-    DNS[Authoritative Route 53 zone in sandbox during workload migration]
+    DNS[Authoritative target Route 53 zone]
 
     DNS -->|keycloak-demo| KALB[New target Keycloak ALB]
     KALB --> TKC[Target EC2 Keycloak]
@@ -115,9 +125,8 @@ For nginx, use existing target VPC `vpc-073150aef0868a8af`:
 
 The target nginx service and new ALB are deployed and validated. Production
 `proxy.solutions.adorsys.com` was cut over to the target ALB on 2026-08-13. The
-source `corsproxy` ALB and ECS service remain available only for rollback during
-monitoring and will be retired after approval; the ALB itself was never copied or
-migrated.
+source `corsproxy` ALB and ECS service were retired after monitoring; the ALB itself
+was never copied or migrated.
 
 ## 5. Migration Approach in Plain Language
 
@@ -608,12 +617,15 @@ Live verification before target-zone preparation on 2026-08-17 found:
 - neither migration account owns the parent `adorsys.com` zone;
 - DNSSEC is not signing either child zone.
 
-Target-zone preparation is now complete. A post-copy `--verify` found no required
+Target-zone preparation completed. A post-copy `--verify` found no required
 changes, confirmed full non-NS/non-SOA parity, verified the three production
 aliases through a target name server, and AWS reported 11 records in each child
-zone. Public authority remains on the sandbox zone. The remaining DNS work starts
-with the parent-zone owner lowering the current 24-hour delegation TTL; no
-additional record copy is required unless a DNS record changes before delegation.
+zone.
+
+The parent delegation was subsequently changed to the target zone's four name
+servers. Verification on 2026-08-26 showed the same target set from the parent and
+public resolvers, HTTP 200 from wallet/proxy/Keycloak discovery, and healthy target
+groups. The sandbox hosted zone has been deleted.
 
 Run `scripts/prepare-route53-zone-migration.sh --dry-run` first. After review,
 `--execute` UPSERTs every non-NS/non-SOA source record into the target zone, waits
@@ -648,7 +660,7 @@ Follow this order because later components depend on earlier ones and the early
 steps do not change production traffic. The command-by-command procedure is in the
 [workflow-free migration runbook](WORKFLOW-FREE-MIGRATION-RUNBOOK.md).
 
-### Phase A — Preparation With No Traffic Change
+### Phase A — Preparation With No Traffic Change (completed)
 
 - Verify that `sandbox` is source account `917848404243` and `default` is target
   account `982081049921`
@@ -762,32 +774,20 @@ configuration or database changes before DNS cutover.
 
 ## 15. Rollback
 
-Keep the source EC2, ECS service, ECR images, buckets, CloudFront distribution, and
-DNS zone during the rollback period.
+The source rollback period is closed. The sandbox EC2, ECS service, ALBs, wallet
+buckets, wallet CloudFront distribution, and hosted zone have been deleted. DNS
+cannot be pointed back to those resources.
 
-If cutover fails before target Keycloak accepts writes:
+Recovery must now use target-account backups and normal service recovery:
 
-1. Point `keycloak-demo` and `proxy` DNS back to the source load balancers.
-2. Point `wallet` back to the source CloudFront distribution.
-3. Reverse the CloudFront alias move if necessary.
-4. Restart or re-enable source Keycloak.
-
-If target Keycloak has accepted writes, do not switch back blindly. First export
-the target database and decide whether to restore it to the source or repair the
-target deployment forward.
-
-Suggested rollback triggers:
-
-- Keycloak target remains unhealthy
-- Login or OIDC issuer validation fails
-- Database validation fails
-- nginx breaks the wallet flow
-- CloudFront alias or certificate fails
-- Metadata images cannot be resolved
+1. Restore or repair target Keycloak/PostgreSQL from target backups.
+2. Roll back the target ECS task definition or CloudFront/S3 deployment.
+3. Keep production DNS on the target resources unless a separately prepared
+   recovery endpoint is available.
 
 ## 16. When the Migration Is Complete
 
-The migration is complete when:
+The following completion conditions were met by 2026-08-26:
 
 - All three public URLs serve target-account resources
 - Keycloak state and database are verified
@@ -796,23 +796,26 @@ The migration is complete when:
 - Target CloudFront serves the wallet; the target metadata bucket serves images directly through `PublicReadGetObject`
 - New target ACM certificates are active
 - Monitoring and backups are verified
-- The rollback period has ended
-- The owner explicitly approves source decommissioning
+- The rollback period ended
+- The owner approved and performed source decommissioning
 
-## 17. Remaining Inputs Before Execution
+## 17. Remaining Migration-Scope DNS Cleanup
 
-Only these details still need to be confirmed:
+1. Remove the target-zone test records `wallet-migration`, `proxy-migration`, and
+   `test-kc` after a separately reviewed DNS change.
+2. Remove `_wallet` after accepting that the CloudFront cross-account alias move
+   needs no further rollback proof.
+3. Remove `_f6b...` because the source wildcard certificate is gone; retain the
+   target `_6878...` ACM validation CNAME.
+4. Remove apex TXT value `hzcqp17swv` based on the team's confirmation that no
+   migrated resource uses it and the absence of any local project reference. AWS
+   cannot identify an unknown external service that may once have used an opaque
+   verification token, so this remains an owner decision rather than an AWS-proven
+   dependency check.
 
-1. Active Keycloak/Wazuh image
-2. Database engine, version, name, and volume path
-3. Exact Keycloak scripts and Compose files on the source host
-4. Existing target subnet and security-group selections
-5. Confirmed names, public subnets, private/application subnets, and security rules
-   for the new dedicated target Keycloak ALB
-6. Maintenance window and acceptable downtime
-7. Rollback retention period
-8. Owner of the parent `adorsys.com` DNS delegation
-9. Issuers that still publish direct `wallet-app-metadata` URLs
+The `adorsys-keycloak-backup-test` bucket, `/ecs/keycloakad` log group, and
+`kc_wazuh`/`keycloak-wazuh` repositories are not managed by this team. They are
+outside this migration and are not deletion candidates in this plan.
 
 ## 18. AWS References
 

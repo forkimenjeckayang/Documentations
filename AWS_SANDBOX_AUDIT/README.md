@@ -4,14 +4,14 @@
 **Source workload Region:** `eu-north-1`  
 **Target account:** `982081049921` (profile `default`)  
 **Target workload Region:** `eu-central-1`  
-**Last live source audit:** 2026-08-14 using read-only AWS CLI calls
+**Last live source audit:** 2026-08-26 using read-only AWS CLI calls
 
-**Last live migration verification:** 2026-08-17 after Keycloak production DNS
-cutover, public HTTPS/OIDC verification, and target Route 53 record-parity checks
+**Last live migration verification:** 2026-08-26 after source retirement,
+authoritative DNS cutover, public HTTPS/OIDC checks, and target health checks
 
-This repository documents the remaining legacy-sandbox resources and their
-migration to the target AWS account. It does not create a new VPC; target resources
-must use the networking already available in the target account.
+This repository records the completed migration of the legacy wallet, nginx proxy,
+and Keycloak workloads from the sandbox account to the target account. The target
+uses its existing networking; no VPC was created or migrated.
 
 ## Documentation
 
@@ -43,41 +43,43 @@ operational planning artifact, not an additional authoritative runbook.
 
 ## Current Legacy-Sandbox State
 
-| Component | Identifier | Last verified state |
+| Component | Identifier | State verified 2026-08-26 |
 |---|---|---|
-| RDS | `kc-ssi` | Removed; no RDS DB instances remained in `eu-north-1` |
-| Secrets Manager | `verifier-secrets` | Scheduled for deletion; recoverable until its deletion window ends |
-| EC2 | `Keycloak-demo` | Running and healthy; hosts Keycloak and containerized PostgreSQL |
-| ACM | `*.solutions.adorsys.com` | Source certificates active; target `eu-central-1` and `us-east-1` certificates issued |
-| ECS | `Datev_Wallet/nginx-cors` | Active with one desired and one running Fargate task |
-| ECR | `kc_wazuh`, `keycloak-wazuh`, `nginx_datev_wallet` | Three repositories remained at the last audit |
-| S3 | `wallet-react-app`, `wallet-app-metadata` | Source buckets active; content copied to target `*-main` buckets |
-| CloudFront | `E32T5I17KDIDEL` | Source wallet distribution active |
-| ALB | `corsproxy`, `keycloak-demo-LB` | Source internet-facing load balancers active |
+| Route 53 | `Z02911502N07V5SNAMLHL` | Removed; no `solutions.adorsys.com` zone remains in sandbox |
+| RDS | `kc-ssi` | Removed; no RDS DB instances remain in `eu-north-1` |
+| Secrets Manager | `verifier-secrets` | Removed; no secrets, including planned deletions, remain in `eu-north-1` |
+| EC2 | `Keycloak-demo` | Removed; only unrelated `fifa` remains running |
+| ACM | `*.solutions.adorsys.com` | Removed from sandbox `eu-north-1` |
+| ECS | `Datev_Wallet/nginx-cors` | Removed; no ECS clusters remain in `eu-north-1` |
+| ECR | `nginx_datev_wallet` | Removed |
+| S3 | `wallet-react-app`, `wallet-app-metadata` | Removed |
+| CloudFront | `E32T5I17KDIDEL` | Removed; unrelated `event-app0` distribution remains |
+| ALB/target groups | `corsproxy`, `keycloak-demo-LB` | Removed; no sandbox ALBs or target groups remain in `eu-north-1` |
+| AMI/EBS | Keycloak migration source AMI/snapshot/volume | No matching AMI or unattached EBS volume remains |
 
-This table covers the legacy Keycloak/wallet workload, not every resource in the
-sandbox account.
+This table covers the migrated Keycloak/wallet workload, not every resource in the
+sandbox account. Unrelated hosted zones, S3 buckets, the `fifa` EC2 instance, its
+Elastic IP, and the `event-app0` CloudFront distribution remain outside this scope.
+The `adorsys-keycloak-backup-test` bucket, `/ecs/keycloakad` log group, and
+`kc_wazuh`/`keycloak-wazuh` repositories are not managed by this team or this
+migration. They were not migrated or deleted and are explicitly out of scope.
 
-## Verification Evidence and Exceptions
+## Final Verification Evidence and Exceptions
 
-- STS confirmed source account `917848404243` during the 2026-08-11 audit.
-- RDS returned no DB instances in `eu-north-1`.
-- `verifier-secrets` had a deletion timestamp, so “scheduled for deletion” is
-  more accurate than “removed” until AWS completes the deletion.
-- `Keycloak-demo` (`i-03eac5cc262731ede`, `t3.medium`) was running with both
-  instance and system checks passing.
-- A separate `fifa` instance existed but was outside the supplied migration scope.
-- `Datev_Wallet/nginx-cors` used task definition `cors_proxy:6` and image
-  `917848404243.dkr.ecr.eu-north-1.amazonaws.com/nginx_datev_wallet:latest`.
-- The last audit found three ECR repositories, not zero. The archived baseline had
-  14, so 11 removals are directly evidenced by the repository data.
-- The two wallet buckets existed, while 15 other account buckets were outside this
-  audit scope.
-- The source wildcard ALB certificate was issued and attached to `corsproxy` and
-  `keycloak-demo-LB`.
+- STS confirmed sandbox account `917848404243` and target account `982081049921`.
+- The parent `adorsys.com` delegation and public resolvers return only the target
+  zone's four name servers.
+- Public wallet, proxy, and Keycloak OIDC discovery checks all returned HTTP 200.
+- Target nginx ECS is `1 desired / 1 running / 0 pending`; both target ALB target
+  groups report `healthy`.
+- Target CloudFront `E1Z7SXTDZF3Z54`, target Keycloak EC2
+  `i-006ca4ea5780923de`, target buckets, target certificates, and target ECR
+  `nginx_datev_wallet` remain present.
+- Source rollback is no longer available because the sandbox zone and runtime
+  resources have been retired.
 
-Point-in-time inventory can change. Repeat the checks below before a cutover or
-source deletion.
+Point-in-time inventory can change. Repeat the checks below before making the
+remaining target-zone DNS changes.
 
 ## Read-Only Source Verification
 
@@ -92,16 +94,19 @@ aws ecs describe-services --cluster Datev_Wallet --services nginx-cors --profile
 aws ecr describe-repositories --profile sandbox --region eu-north-1
 aws elbv2 describe-load-balancers --profile sandbox --region eu-north-1
 aws s3api list-buckets --profile sandbox
+aws route53 list-hosted-zones --profile sandbox
+aws cloudfront list-distributions --profile sandbox
 ```
 
 Interpretation:
 
 - An empty RDS list confirms no DB instance currently exists in that Region.
 - A secret with `DeletedDate` is scheduled for deletion, not fully deleted.
-- ECS is healthy here when desired and running counts are one and pending is zero.
-- Do not remove `nginx_datev_wallet` while the ECS task references it.
+- An empty ECS cluster list confirms no sandbox ECS service remains in the Region.
+- An empty ALB list does not prove target groups are gone; query them separately.
 - S3 bucket inventory is account-global; distinguish in-scope buckets from
   unrelated account buckets.
+- ECR and CloudWatch Logs can remain after ECS deletion and need separate review.
 
 ## Migration Scripts
 
@@ -147,12 +152,13 @@ they may contain task-definition environment data or sensitive AWS metadata.
 
 | Workload | Status |
 |---|---|
-| Wallet S3 and CloudFront | Migrated; production on target and under monitoring |
-| Metadata S3 data/policy | Migrated; consumer URL updates still require confirmation |
+| Wallet S3 and CloudFront | Complete; production and storage are in target |
+| Metadata S3 data/policy | Complete; target bucket and policy remain active |
 | Target ACM certificates | Issued in `eu-central-1` and `us-east-1` |
-| nginx ECS/ECR/new ALB | Migrated; production DNS points to target ALB and workload is under monitoring |
-| Keycloak EC2/PostgreSQL/new ALB | Migrated; production DNS points to the target ALB, target EC2 and OIDC are healthy, and the workload is under monitoring |
-| Route 53 hosted zone | Target record copy and direct-name-server verification complete; sandbox remains authoritative until the parent delegation changes |
+| nginx ECS/ECR/new ALB | Complete; production and healthy target are in target |
+| Keycloak EC2/PostgreSQL/new ALB | Complete; nginx now proxies to local target Keycloak `26.6.1`, not the retired sandbox EC2 |
+| Route 53 hosted zone | Complete; target zone is authoritative and sandbox zone is removed |
+| Sandbox runtime retirement | Complete for the migration-scoped EC2, ECS, ALBs, wallet S3, wallet CloudFront, ACM, RDS, secret, and nginx ECR resources |
 
 ## Current Migration Notes
 
@@ -165,15 +171,11 @@ they may contain task-definition environment data or sensitive AWS metadata.
 - The target `eu-central-1` and `us-east-1` wildcard certificates are both
   `ISSUED`. ACM gave both certificates the same validation CNAME because they cover
   the same domain in the same target account.
-- The shared validation CNAME was added to the publicly authoritative sandbox
-  Route 53 zone. It validated the `eu-central-1` ALB certificate and the separate
-  `us-east-1` certificate required by CloudFront.
-- Hosted-zone preparation completed on 2026-08-17. Target zone
-  `Z05071841EFF9JQA59TZL` now has 11 records and full non-NS/non-SOA parity with
-  sandbox zone `Z02911502N07V5SNAMLHL`. Direct queries to the target name servers
-  returned answers for wallet, proxy, and Keycloak. Public authority remains on
-  the sandbox zone; the parent DNS owner must lower the current 24-hour delegation
-  TTL, wait for it to expire, and then delegate to the target name servers.
+- The shared target validation CNAME now lives in authoritative target zone
+  `Z05071841EFF9JQA59TZL` and must remain for managed renewal of both certificates.
+- The parent delegation now lists only the target zone's four name servers. The
+  sandbox zone `Z02911502N07V5SNAMLHL` was removed after propagation and service
+  verification.
 - Target CloudFront distribution `E1Z7SXTDZF3Z54` is deployed with OAC
   `ER4JW7O110RQV`, wildcard alias `*.solutions.adorsys.com`, exact alias
   `wallet.solutions.adorsys.com`, and a publicly resolving ownership TXT.
@@ -184,8 +186,7 @@ they may contain task-definition environment data or sensitive AWS metadata.
   `proxy.solutions.adorsys.com` now targets
   `nginx-proxy-migration-1538385164.eu-central-1.elb.amazonaws.com` in the target
   account. Post-cutover checks returned root HTTP 200 and CORS preflight 204;
-  target ECS and ALB health are `1/1`. The source service remains running for
-  rollback during monitoring.
+  target ECS and ALB health are `1/1`. The source service and ALB are removed.
 - Keycloak host verification on 2026-08-14 confirmed one unencrypted 100-GiB gp3
   root EBS volume. Docker uses `/var/lib/docker` on that root filesystem, and the
   PostgreSQL volume is `oid4vci-deployment_db_data`. PostgreSQL runs in Docker;
@@ -196,5 +197,34 @@ they may contain task-definition environment data or sensitive AWS metadata.
   `keycloak-demo-migration-1394321177.eu-central-1.elb.amazonaws.com` in the target
   account. The change reached `INSYNC`; public OIDC discovery returns the expected
   production issuer, and target EC2 `i-006ca4ea5780923de` remains healthy.
+- Final inspection found that the migrated target EC2's copied Nginx configuration
+  still forwarded to the sandbox public IP. On 2026-08-25 the upstream was changed
+  to `https://127.0.0.1:8443`; production now serves local target Keycloak `26.6.1`
+  and its local PostgreSQL database.
 
-Follow the runbook’s validation gates before deleting any source resource.
+## Target DNS Cleanup After Migration
+
+The authoritative target zone currently has 12 records. Remove the following six
+records only through a separately reviewed Route 53 change:
+
+| Record | Why it can be removed |
+|---|---|
+| `wallet-migration.solutions.adorsys.com` CNAME | Temporary CloudFront test name; production uses `wallet` |
+| `proxy-migration.solutions.adorsys.com` CNAME | Temporary nginx ALB test name; production uses `proxy` |
+| `test-kc.solutions.adorsys.com` CNAME | Temporary Keycloak 26.7.2 sandbox test name; its sandbox ALB is gone |
+| `_wallet.solutions.adorsys.com` TXT | Cross-account CloudFront move proof; the target distribution is deployed, owns the wallet aliases, and the source distribution is gone |
+| `_f6b7758537e4053cb82aca563f36b245.solutions.adorsys.com` CNAME | Source ACM validation record; no sandbox `*.solutions.adorsys.com` certificate remains |
+| `solutions.adorsys.com` TXT `hzcqp17swv` | Copied legacy token; based on the team's confirmation, no migrated AWS resource uses it, and no local project reference was found |
+
+Keep the zone's NS/SOA records, the three production aliases, and
+`_6878d810540ccb0bc9697193272cc087.solutions.adorsys.com`, which validates both
+target certificates.
+
+After removing `_wallet`, do not rerun `create-wallet-cloudfront.sh` as an
+operational maintenance command. It is a completed migration-preparation script
+tied to the deleted source zone and will fail its source-zone safety checks. Its
+failure does not affect the existing target distribution.
+
+The migration is operationally complete. Remaining work is the six-record target
+DNS cleanup above. The unrelated sandbox resources are outside this migration and
+must not be changed through this cleanup.

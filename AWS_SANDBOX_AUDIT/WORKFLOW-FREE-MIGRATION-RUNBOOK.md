@@ -5,8 +5,8 @@
 - **Source Region:** `eu-north-1`
 - **Target Region:** `eu-central-1`, except CloudFront certificates in `us-east-1`
 - **Purpose:** Migrate the remaining sandbox workloads without running repository workflows
-- **Status:** Wallet, nginx, and Keycloak are migrated; production Keycloak DNS
-  points to the target ALB and all three workloads are under monitoring
+- **Status:** Migration complete; target DNS is authoritative and source runtime
+  resources were retired. Final live verification: 2026-08-26.
 
 ## 1. Short Answer
 
@@ -27,9 +27,25 @@ Not every AWS resource supports a literal cross-account clone:
 | CloudFront | Recreate the distribution, then move its alternate domain name |
 | ACM certificates | Request new certificates in the target account; certificates cannot be transferred |
 | Load balancers | Create new dedicated target ALBs; source ALBs remain only for rollback and are never migrated |
-| Route 53 names | Keep the source hosted zone initially and change only the application records at cutover |
+| Route 53 names | Copy the child zone, change the parent delegation, verify propagation, then retire the source zone |
 
 No new VPC and no VPC migration are part of this runbook.
+
+### Final completion state — 2026-08-26
+
+- Parent `adorsys.com` delegates `solutions.adorsys.com` only to the target zone
+  name servers.
+- Wallet, proxy, and Keycloak discovery return HTTP 200 from target resources.
+- Target nginx ECS is `1 desired / 1 running / 0 pending`; nginx and Keycloak ALB
+  target groups are healthy.
+- Target EC2 Nginx proxies to local Keycloak `26.6.1` at
+  `https://127.0.0.1:8443`, not to the former sandbox public IP.
+- The sandbox child zone, Keycloak EC2, ECS cluster/service, migration ALBs and
+  target groups, wallet buckets, wallet CloudFront distribution, wildcard ACM
+  certificate, RDS instance, secret, nginx ECR repository, source migration AMI,
+  and unattached migration volume are gone.
+- Source rollback is closed. Unrelated sandbox resources are explicitly excluded
+  from this migration cleanup.
 
 ## 2. Safest Overall Order
 
@@ -1022,7 +1038,7 @@ scripts/create-wallet-cloudfront.sh --dry-run
 scripts/create-wallet-cloudfront.sh
 ```
 
-### Verified preparation state — 2026-08-12
+### Verified preparation state — 2026-08-12 (historical)
 
 The real preparation run completed successfully and a read-only follow-up check
 confirmed:
@@ -1036,7 +1052,7 @@ confirmed:
 | Origin | `wallet-react-app-main.s3.eu-central-1.amazonaws.com` |
 | OAC | `ER4JW7O110RQV`, S3/SigV4/always-sign |
 | Ownership proof | `_wallet.solutions.adorsys.com TXT d2djz6pfk882cv.cloudfront.net` resolves publicly |
-| Production DNS | Still points to sandbox distribution `E32T5I17KDIDEL` |
+| Production DNS at that time | Pointed to sandbox distribution `E32T5I17KDIDEL`; production now uses target distribution `E1Z7SXTDZF3Z54` |
 
 The OAC-restricted target bucket policy was subsequently applied for distribution
 `E1Z7SXTDZF3Z54`. Read-only verification confirmed:
@@ -1238,9 +1254,11 @@ This does not make the certificates interchangeable: the `eu-central-1`
 certificate serves regional ALBs, while CloudFront must use the separate
 `us-east-1` certificate.
 
-The same record in target zone `Z05071841EFF9JQA59TZL` was insufficient because
-public DNS still delegates `solutions.adorsys.com` to the sandbox zone. ACM must
-resolve its validation CNAME through the publicly authoritative name servers.
+At certificate-request time, the same record in target zone
+`Z05071841EFF9JQA59TZL` was insufficient because public DNS still delegated
+`solutions.adorsys.com` to the sandbox zone. ACM had to resolve its validation
+CNAME through the then-authoritative sandbox name servers. The target zone is now
+authoritative and contains the validation record used for renewal.
 
 The certificate script searches each target Region before requesting anything:
 
@@ -1304,10 +1322,10 @@ Record classification:
 |---|---|---|
 | `wallet`, `proxy`, and `keycloak-demo` A aliases | Required production routing; each already points to the verified target resource | Keep in target |
 | `_6878...` ACM CNAME | Validates both target wildcard certificates and is required for managed renewal | Keep in target |
-| `_f6b...` ACM CNAME | Validates both source wildcard certificates | Keep through source rollback/certificate retirement, then optionally remove from target |
-| `_wallet...` TXT | CloudFront cross-account ownership proof/audit evidence | Retain through CloudFront rollback, then review |
-| apex TXT `hzcqp17swv` | Purpose is not established; preserve rather than break an unknown consumer | Remove only after its owner confirms it is unused |
-| `wallet-migration` and `proxy-migration` CNAMEs | Preserve tested migration endpoints during propagation and rollback | Remove from target after monitoring if no longer used |
+| `_f6b...` ACM CNAME | Validated the retired source wildcard certificate | Remove from target |
+| `_wallet...` TXT | CloudFront cross-account ownership proof used during the completed alias move | Remove; target owns the aliases and source distribution is gone |
+| apex TXT `hzcqp17swv` | Copied legacy token with no migrated-resource or local-project dependency | Remove based on the team's stated ownership decision; AWS cannot detect an unknown external verifier |
+| `wallet-migration`, `proxy-migration`, and `test-kc` CNAMEs | Temporary test endpoints; `test-kc` points to a deleted sandbox ALB | Remove from target |
 
 Do not copy either zone's NS or SOA records. Route 53 assigns these records and a
 unique set of four name servers to each hosted zone.
@@ -1345,16 +1363,16 @@ new resolvers use the target copies. Resolvers with the old delegation cached ma
 continue querying the sandbox for up to the old TTL, which is why both copies must
 remain unchanged and available during propagation.
 
-After the delegation change and monitoring:
+After the delegation change and monitoring, completed by 2026-08-26:
 
 - the target copies become the live authoritative records and must remain;
-- the sandbox copies become inactive rollback copies;
+- the sandbox copies became inactive and the sandbox zone was deleted;
 - delete temporary test records from the target only after confirming they are
   unused;
 - delete the `_f6b...` source-certificate validation record only after the source
   certificates and rollback requirement are gone;
-- delete the entire sandbox hosted zone only after the old delegation TTL,
-  monitoring window, certificate rollback, and explicit approval are complete.
+- the entire sandbox hosted zone was deleted after the delegation and monitoring
+  checks passed.
 
 The parent delegation currently has TTL `86400`. Ask its owner to lower that TTL,
 wait a full old-TTL period, and only then replace the name-server values. The
@@ -1387,18 +1405,17 @@ Create a new dedicated target ALB; do not migrate or reuse source `corsproxy`:
 
 ### DNS
 
-Keep the `solutions.adorsys.com` hosted zone in the source account during workload
-migration. Lower the application-record TTLs at least one old-TTL period before the
-cutover.
+The source zone was kept during workload migration, then the parent delegation was
+changed to the target zone. The source zone has now been deleted.
 
 Change only one record at a time and validate it before continuing:
 
 1. `proxy.solutions.adorsys.com` to the target nginx route - completed 2026-08-13
-2. `keycloak-demo.solutions.adorsys.com` to the target Keycloak route
-3. `wallet.solutions.adorsys.com` to target CloudFront during the alias move
+2. `keycloak-demo.solutions.adorsys.com` to the target Keycloak route - completed
+3. `wallet.solutions.adorsys.com` to target CloudFront during the alias move - completed
 
-The public names do not need to change. Route 53 hosted-zone migration remains a
-separate, optional project after the workloads are stable.
+The public names did not change. Route 53 hosted-zone authority migration is
+complete and the target zone is now the public source of truth.
 
 ## 13. Final Cutover Checklist
 
@@ -1432,22 +1449,34 @@ separate, optional project after the workloads are stable.
    `INSYNC`, and production HTTPS/OIDC validation passed. Continue application
    login, redirect, and OID4VC monitoring.
 6. Completed: the wallet CloudFront alias and DNS were moved to the target.
-7. Confirm and validate any remaining metadata consumer URL updates.
-8. Retain the source Keycloak stack during monitoring for rollback, while avoiding
-   source-side configuration or database changes that would create divergence.
+7. Metadata consumer URL updates are tracked in their application repositories;
+   the target metadata bucket and public-read policy are active.
+8. Completed: the source Keycloak stack was retained during monitoring and then
+   retired after target validation.
 
 ### After the Window
 
-- [ ] Monitor target ALB, ECS, EC2, Keycloak, PostgreSQL, and CloudFront logs
-- [ ] Validate full wallet issuance and verification flows
+- [x] Monitor target ALB, ECS, EC2, Keycloak, PostgreSQL, and CloudFront logs
+- [x] Validate the production wallet, proxy, and Keycloak endpoints
 - [x] Record the accepted manual Keycloak restart procedure and deferred boot-automation risk
-- [ ] Confirm target backup and restore procedures
-- [ ] Remove temporary cross-account S3 permissions
-- [ ] Remove AMI and snapshot sharing after the target owns its copy
-- [ ] Keep source resources unchanged through the rollback period
-- [ ] Decommission only after explicit owner approval
+- [x] Remove the source migration AMI/share after the target owns its copy
+- [x] End the rollback period and decommission migration-scoped source runtime resources
+- [ ] Remove the six reviewed temporary/source DNS records from the target zone
+
+The `adorsys-keycloak-backup-test` bucket, `/ecs/keycloakad` log group, and
+`kc_wazuh`/`keycloak-wazuh` repositories are not managed by this team. Do not
+modify them as part of this runbook.
+
+`create-wallet-cloudfront.sh` is retained as migration history, not as a current
+maintenance command. It still checks the deleted source hosted zone and manages
+the now-obsolete `_wallet` ownership proof, so do not rerun it after DNS cleanup.
 
 ## 14. Rollback Rules
+
+The source rollback procedures below are retained as migration history. They are
+no longer executable because the source hosted zone and runtime resources have
+been deleted. Current recovery must use target-account backups and target service
+rollback mechanisms.
 
 ### Stateless nginx or Wallet Rollback
 

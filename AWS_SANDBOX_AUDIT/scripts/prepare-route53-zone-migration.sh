@@ -285,7 +285,7 @@ print_record_classification() {
   log "  CNAME _6878... -> target ACM validation (must remain)"
   log "  CNAME _f6b... -> source ACM validation (retain for rollback)"
   log "  TXT _wallet... -> CloudFront cross-account ownership proof"
-  log "  TXT solutions.adorsys.com -> preserve until its owner confirms purpose"
+  log "  TXT solutions.adorsys.com -> copied legacy token; review separately after migration"
   log "Temporary test records preserved initially:"
   log "  CNAME wallet-migration.solutions.adorsys.com"
   log "  CNAME proxy-migration.solutions.adorsys.com"
