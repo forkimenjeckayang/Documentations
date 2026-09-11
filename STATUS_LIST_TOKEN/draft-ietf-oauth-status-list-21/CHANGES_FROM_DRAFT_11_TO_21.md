@@ -16,8 +16,8 @@
 | Title | Token Status List (no TSL abbrev) | **Token Status List (TSL)** consistently, Abstract + Sec 1 |
 | Sec 1 | Intro, Use Cases, Rationale, Design Goals, Prior Work, Status Mechanisms Registry (all already present) | Same structure; text refinements, SD-JWT (RFC 9901) + SD-CWT refs added in -18, intro nits in -16 |
 | Sec 2/3 | Conventions + Terminology together | Split: Sec 2 Conventions, Sec 3 Terminology + new **Client** term (-13) + **Status** definition |
-| Sec 10-14 | Sec 10 Privacy?/11 Implementation? layout differs; X.509 EKU inline | Sec 10 X.509 EKU (own section), 11 Security (+11.4/11.5/11.6 new), 12 Privacy, **13 Operational**, 14 IANA (extended) |
-| Appendices | Size comparison tables + Test vectors + Document History (all present) | + **A ASN.1 module** (new in -14), **B Size Comparison** (formalized appendix, same numbers), **C Test vectors** (binary display), Document History continued |
+| Sec 10-14 | Sec 10 X.509 EKU (already own section), Sec 11 Security, 12 Privacy, 13 **Implementation** Considerations; EKU OID registered in Sec 14.9 (no description field) | Sec 10 X.509 EKU kept (OID reworded), 11 Security (+11.4/11.5/11.6 new), 12 Privacy (12.2 renamed "Malicious Issuers"→"Issuer Tracking", 12.5.1/12.5.2 collusion subsections merged into "Cross-party Collusion"), **13 renamed Operational Considerations** + new 13.2 Linkability Mitigation, 14 IANA (extended; Sec 14.9 adds description field + ASN.1 module OID registration) |
+| Appendices | Unnumbered: Size comparison + Test vectors + Document History (no ASN.1) | **A ASN.1 module** (new, -14), **B Size Comparison** (formalized, same numbers), **C Test vectors** (renamed, binary display), Document History continued |
 
 ## 2. Normative / Breaking Changes
 
@@ -55,7 +55,7 @@
 
 ## 5. References / Examples
 
-- **Added in -21 vs -11**: SD-JWT (RFC 9901, -17/-18), SD-CWT (`I-D.ietf-spice-sd-cwt`, -18), SD-JWT VC updated (`-08` → `-16`), ISO 18013-5 link (-19), RFC 8126 (IANA procedures, replaces RFC 5226, -20), RFC 9562 (UUID, -21). RFC 9110, RFC 9458, RFC 8725, RFC 9596 were already in -11.
+- **Added in -21 vs -11**: SD-JWT (RFC 9901, -17/-18), SD-CWT (`I-D.ietf-spice-sd-cwt`, -18), SD-JWT VC updated (`-08` → `-16`), ISO 18013-5 link (-19), RFC 8126 (IANA procedures, replaces RFC 5226, -20), RFC 9562 (UUID refs in Size Comparison appendix; not in -11, not listed in a specific history entry — likely RFC Editor/editorial). RFC 9110, RFC 9458, RFC 8725, RFC 9596 were already in -11.
 - SD-JWT VC ref changed to SD-JWT in -17 then re-added alongside in -18 (current -21 lists JWT, SD-JWT, SD-JWT VC, CWT, SD-CWT, mdoc; -11 listed JWT, SD-JWT VC, CWT, mdoc).
 - Removed non-normative ISO mdoc examples (-16), removed DL suspension example (-14).
 - Test vectors: binary display only (-14), still `2^20` entries init, C.1 1-bit, C.2 2-bit, C.3 4-bit, C.4 8-bit (same examples `eNrbuRgAAhcBXQ`, `eNo76fITAAPfAgc` in both).
