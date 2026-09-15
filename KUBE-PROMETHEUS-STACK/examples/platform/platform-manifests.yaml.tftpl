@@ -1,0 +1,58 @@
+# A YAML LIST: Terraform decodes it and supplies chart extraManifests.
+# Prerequisite: existing ESO controller + CRDs serving external-secrets.io/v1.
+- apiVersion: external-secrets.io/v1
+  kind: SecretStore
+  metadata: {name: platform-secrets, namespace: monitoring}
+  spec:
+    provider:
+      aws:
+        service: SecretsManager
+        region: "${aws_region}"
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata: {name: grafana-admin, namespace: monitoring}
+  spec:
+    refreshInterval: 1h
+    secretStoreRef: {name: platform-secrets, kind: SecretStore}
+    target: {name: grafana-admin, creationPolicy: Owner}
+    data:
+      - secretKey: admin-user
+        remoteRef: {key: "${grafana_secret_arn}", property: admin-user}
+      - secretKey: admin-password
+        remoteRef: {key: "${grafana_secret_arn}", property: admin-password}
+- apiVersion: external-secrets.io/v1
+  kind: ExternalSecret
+  metadata: {name: platform-receiver, namespace: monitoring}
+  spec:
+    refreshInterval: 1h
+    secretStoreRef: {name: platform-secrets, kind: SecretStore}
+    target: {name: platform-receiver, creationPolicy: Owner}
+    data:
+      - secretKey: webhook_url
+        remoteRef: {key: "${platform_receiver_secret_arn}", property: webhook_url}
+      - secretKey: username
+        remoteRef: {key: "${platform_receiver_secret_arn}", property: username}
+      - secretKey: password
+        remoteRef: {key: "${platform_receiver_secret_arn}", property: password}
+- apiVersion: monitoring.coreos.com/v1alpha1
+  kind: AlertmanagerConfig
+  metadata:
+    name: platform-routing
+    namespace: monitoring
+    labels: {release: kube-prometheus-stack}
+  spec:
+    route:
+      receiver: platform-sre
+      groupBy: [cluster, namespace, alertname]
+      groupWait: 30s
+      groupInterval: 5m
+      repeatInterval: 4h
+    receivers:
+      - name: platform-sre
+        webhookConfigs:
+          - urlSecret: {name: platform-receiver, key: webhook_url}
+            sendResolved: true
+            httpConfig:
+              basicAuth:
+                username: {name: platform-receiver, key: username}
+                password: {name: platform-receiver, key: password}

@@ -1,0 +1,134 @@
+# Reviewed overrides, not a copy of all upstream chart defaults.
+defaultRules:
+  create: true
+
+prometheusOperator:
+  featureGates:
+    StatusForConfigurationResources: true
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+prometheus:
+  enabled: true
+  service: {type: ClusterIP}
+  prometheusSpec:
+    replicas: 1
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+    retention: 35d
+    retentionSize: 80GB
+    externalLabels:
+      cluster: example-eks
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelector:
+      matchLabels: {release: kube-prometheus-stack}
+    serviceMonitorNamespaceSelector: {}
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelector:
+      matchLabels: {release: kube-prometheus-stack}
+    podMonitorNamespaceSelector: {}
+    ruleSelectorNilUsesHelmValues: false
+    ruleSelector:
+      matchLabels: {release: kube-prometheus-stack}
+    ruleNamespaceSelector: {}
+    probeSelectorNilUsesHelmValues: false
+    probeSelector:
+      matchLabels: {release: kube-prometheus-stack}
+    probeNamespaceSelector: {}
+    scrapeConfigSelectorNilUsesHelmValues: false
+    scrapeConfigSelector:
+      matchLabels: {release: kube-prometheus-stack}
+    scrapeConfigNamespaceSelector: {}
+    resources:
+      requests: {cpu: 500m, memory: 2Gi}
+      limits: {cpu: "2", memory: 8Gi}
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: monitoring-gp3
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests: {storage: 100Gi}
+
+alertmanager:
+  enabled: true
+  service: {type: ClusterIP}
+  alertmanagerSpec:
+    replicas: 1
+    alertmanagerConfiguration:
+      name: platform-routing
+    alertmanagerConfigSelector:
+      matchLabels: {release: kube-prometheus-stack}
+    alertmanagerConfigNamespaceSelector: {}
+    alertmanagerConfigMatcherStrategy:
+      type: OnNamespace
+    resources:
+      requests: {cpu: 100m, memory: 256Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: monitoring-gp3
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests: {storage: 5Gi}
+
+grafana:
+  enabled: true
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  service: {type: ClusterIP}
+  ingress: {enabled: false}
+  persistence:
+    enabled: true
+    type: sts
+    storageClassName: monitoring-gp3
+    accessModes: [ReadWriteOnce]
+    size: 10Gi
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+  sidecar:
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {cpu: 200m, memory: 128Mi}
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+      label: grafana_dashboard
+      labelValue: "1"
+    datasources:
+      enabled: true
+      defaultDatasourceEnabled: true
+      isDefaultDatasource: true
+      name: Prometheus
+      uid: prometheus
+  grafana.ini:
+    auth.anonymous:
+      enabled: false
+
+kubeStateMetrics: {enabled: true}
+kube-state-metrics:
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+nodeExporter: {enabled: true}
+prometheus-node-exporter:
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: 200m, memory: 128Mi}
+
+# Managed EKS control-plane endpoints are not all available for direct scraping.
+kubeEtcd: {enabled: false}
+kubeControllerManager: {enabled: false}
+kubeScheduler: {enabled: false}
+kubeProxy: {enabled: false}
+kubeApiServer: {enabled: true}
+kubelet:
+  enabled: true
+  serviceMonitor:
+    cAdvisor: true
+coreDns: {enabled: true}

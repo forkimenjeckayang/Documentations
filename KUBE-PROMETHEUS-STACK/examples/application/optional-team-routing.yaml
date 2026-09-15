@@ -1,0 +1,59 @@
+# Optional: use the platform fallback if no team destination is required.
+# This fictional ARN must be replaced. ESO's IAM role must also be granted
+# access to this additional secret; the platform example grants only its own two.
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata: {name: team-secrets, namespace: shop-prod}
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: eu-central-1
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata: {name: checkout-receiver, namespace: shop-prod}
+spec:
+  refreshInterval: 1h
+  secretStoreRef: {name: team-secrets, kind: SecretStore}
+  target: {name: checkout-receiver, creationPolicy: Owner}
+  data:
+    - secretKey: webhook_url
+      remoteRef:
+        key: arn:aws:secretsmanager:eu-central-1:111122223333:secret:replace-team-receiver-AbCdEf
+        property: webhook_url
+    - secretKey: username
+      remoteRef:
+        key: arn:aws:secretsmanager:eu-central-1:111122223333:secret:replace-team-receiver-AbCdEf
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: arn:aws:secretsmanager:eu-central-1:111122223333:secret:replace-team-receiver-AbCdEf
+        property: password
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: checkout-team
+  namespace: shop-prod
+  labels: {release: kube-prometheus-stack}
+spec:
+  route:
+    receiver: commerce-team
+    matchers:
+      - name: service
+        value: checkout
+        matchType: "="
+    groupBy: [namespace, alertname]
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 4h
+  receivers:
+    - name: commerce-team
+      webhookConfigs:
+        - urlSecret: {name: checkout-receiver, key: webhook_url}
+          sendResolved: true
+          httpConfig:
+            basicAuth:
+              username: {name: checkout-receiver, key: username}
+              password: {name: checkout-receiver, key: password}

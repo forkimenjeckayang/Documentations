@@ -1,0 +1,106 @@
+# Assumes namespace shop-prod and an existing instrumented checkout Deployment.
+# The Pod template must have app.kubernetes.io/name: checkout and expose
+# a container port named metrics listening on 0.0.0.0:9090.
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout-metrics
+  namespace: shop-prod
+  labels: {app.kubernetes.io/name: checkout}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: checkout}
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: checkout
+  namespace: shop-prod
+  labels: {release: kube-prometheus-stack}
+spec:
+  namespaceSelector:
+    matchNames: [shop-prod]
+  selector:
+    matchLabels: {app.kubernetes.io/name: checkout}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: checkout
+  namespace: shop-prod
+  labels: {release: kube-prometheus-stack}
+spec:
+  groups:
+    - name: checkout
+      rules:
+        - record: checkout:request_rate5m
+          expr: sum by (namespace) (rate(checkout_requests_total{namespace="shop-prod"}[5m]))
+        - alert: CheckoutMetricsUnreachable
+          expr: up{namespace="shop-prod",service="checkout-metrics"} == 0
+          for: 2m
+          labels: {severity: warning, team: commerce, service: checkout}
+          annotations:
+            summary: Checkout metrics endpoint is unreachable
+            description: "Prometheus cannot scrape {{ $labels.instance }}. This is not proof the public API is down."
+        - alert: CheckoutHighErrorRate
+          expr: |
+            (
+              sum by (namespace) (rate(checkout_requests_total{namespace="shop-prod",status=~"5.."}[5m]))
+              /
+              sum by (namespace) (rate(checkout_requests_total{namespace="shop-prod"}[5m]))
+            ) > 0.05
+            and
+            sum by (namespace) (rate(checkout_requests_total{namespace="shop-prod"}[5m])) > 1
+          for: 10m
+          labels: {severity: critical, team: commerce, service: checkout}
+          annotations:
+            summary: Checkout has a sustained high server-error rate
+            description: More than 5% server errors with traffic above 1 request/second for 10 minutes.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checkout-dashboard
+  namespace: shop-prod
+  labels: {grafana_dashboard: "1"}
+data:
+  checkout.json: |
+    {
+      "uid": "checkout-overview",
+      "title": "Checkout overview",
+      "schemaVersion": 39,
+      "version": 1,
+      "tags": ["checkout", "commerce"],
+      "timezone": "browser",
+      "time": {"from": "now-1h", "to": "now"},
+      "refresh": "30s",
+      "panels": [
+        {
+          "id": 1,
+          "title": "Requests per second",
+          "type": "timeseries",
+          "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+          "targets": [{"refId": "A", "expr": "sum(rate(checkout_requests_total{namespace=\"shop-prod\"}[5m]))"}]
+        },
+        {
+          "id": 2,
+          "title": "Server-error fraction",
+          "type": "timeseries",
+          "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
+          "targets": [{"refId": "A", "expr": "sum(rate(checkout_requests_total{namespace=\"shop-prod\",status=~\"5..\"}[5m])) / sum(rate(checkout_requests_total{namespace=\"shop-prod\"}[5m]))"}]
+        }
+      ]
+    }
